@@ -2088,7 +2088,23 @@ pub fn rustdesk_interval(i: Interval) -> ThrottledInterval {
     ThrottledInterval::new(i)
 }
 
+/// Compile-time host-only (SOS) defaults. Equivalent to shipping a signed
+/// `custom.txt` with these keys, but baked in so no signing / config file is
+/// needed. Runs very early (from `load_custom_client`), before Flutter starts,
+/// so both the UI and the portable-service child process see the same values.
+#[cfg(feature = "host_only")]
+fn apply_host_only_defaults() {
+    let mut hard = config::HARD_SETTINGS.write().unwrap();
+    hard.insert("conn-type".to_owned(), "incoming".to_owned());
+    hard.insert("disable-settings".to_owned(), "Y".to_owned());
+    hard.insert("disable-installation".to_owned(), "Y".to_owned());
+    drop(hard);
+    *config::APP_NAME.write().unwrap() = "远程协助".to_owned();
+}
+
 pub fn load_custom_client() {
+    #[cfg(feature = "host_only")]
+    apply_host_only_defaults();
     #[cfg(debug_assertions)]
     if let Ok(data) = std::fs::read_to_string("./custom.txt") {
         read_custom_client(data.trim());

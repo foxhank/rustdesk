@@ -26,7 +26,12 @@ use_samplerate = ["samplerate"]
 use_rubato = ["rubato"]
 use_dasp = ["dasp"]
 flutter = ["flutter_rust_bridge"]
-default = ["use_dasp"]
+# SOS host-only (incoming-only) client: bakes conn-type=incoming,
+# disable-settings, disable-installation and the app name at compile time.
+# Lives in `default` so every build on this branch is host-only; master does
+# not define this feature.
+host_only = []
+default = ["use_dasp", "host_only"]
 hwcodec = ["scrap/hwcodec"]
 vram = ["scrap/vram"]
 mediacodec = ["scrap/mediacodec"]
