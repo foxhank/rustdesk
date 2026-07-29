@@ -114,9 +114,14 @@ jobs:
 
       - name: Apply custom server config
         shell: bash
+        env:
+          RENDEZVOUS_SERVER: ${{ secrets.RENDEZVOUS_SERVER }}
+          RS_PUB_KEY: ${{ secrets.RS_PUB_KEY }}
         run: |
-          sed -i.bak 's/rs-ny.rustdesk.com/rustdesk.foxhank.cn/g' libs/hbb_common/src/config.rs
-          sed -i.bak 's|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|20050723|g' libs/hbb_common/src/config.rs
+          SERVER="${RENDEZVOUS_SERVER:-rs-ny.rustdesk.com}"
+          KEY="${RS_PUB_KEY:-OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=}"
+          sed -i.bak "s/rs-ny.rustdesk.com/${SERVER}/g" libs/hbb_common/src/config.rs
+          sed -i.bak "s|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${KEY}|g" libs/hbb_common/src/config.rs
           rm -f libs/hbb_common/src/config.rs.bak
 
       - name: Download bridge artifacts
@@ -265,7 +270,13 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: ./release
-          merge-multiple: true
+
+      - name: Package Windows
+        shell: bash
+        run: |
+          cd ./release/rustdesk-Windows-x64
+          zip -r ../../rustdesk-${{ github.ref_name }}-windows-x64.zip .
+          cd ../..
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -276,5 +287,5 @@ jobs:
           body: Custom build for foxhank server
           draft: false
           prerelease: false
-          files: ./release/**/*
+          files: rustdesk-${{ github.ref_name }}-windows-x64.zip
 
