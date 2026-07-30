@@ -126,8 +126,9 @@ jobs:
         run: |
           SERVER="${RENDEZVOUS_SERVER:-rs-ny.rustdesk.com}"
           KEY="${RS_PUB_KEY:-OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=}"
-          sed -i "s/rs-ny.rustdesk.com/${SERVER}/g" libs/hbb_common/src/config.rs
-          sed -i "s|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${KEY}|g" libs/hbb_common/src/config.rs
+          sed -i.bak "s/rs-ny.rustdesk.com/${SERVER}/g" libs/hbb_common/src/config.rs
+          sed -i.bak "s|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${KEY}|g" libs/hbb_common/src/config.rs
+          rm -f libs/hbb_common/src/config.rs.bak
 
       - name: Restore bridge files
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -417,8 +418,9 @@ jobs:
         run: |
           SERVER="${RENDEZVOUS_SERVER:-rs-ny.rustdesk.com}"
           KEY="${RS_PUB_KEY:-OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=}"
-          sed -i "s/rs-ny.rustdesk.com/${SERVER}/g" libs/hbb_common/src/config.rs
-          sed -i "s|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${KEY}|g" libs/hbb_common/src/config.rs
+          sed -i.bak "s/rs-ny.rustdesk.com/${SERVER}/g" libs/hbb_common/src/config.rs
+          sed -i.bak "s|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${KEY}|g" libs/hbb_common/src/config.rs
+          rm -f libs/hbb_common/src/config.rs.bak
 
       - name: Install LLVM and Clang
         uses: rustdesk-org/install-llvm-action-32bit@6aa7d9ad3df84dff01cd4596dd0fc880a7f47fce # no release tag; commit 2026-05-26
@@ -579,8 +581,9 @@ jobs:
         run: |
           SERVER="${RENDEZVOUS_SERVER:-rs-ny.rustdesk.com}"
           KEY="${RS_PUB_KEY:-OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=}"
-          sed -i "s/rs-ny.rustdesk.com/${SERVER}/g" libs/hbb_common/src/config.rs
-          sed -i "s|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${KEY}|g" libs/hbb_common/src/config.rs
+          sed -i.bak "s/rs-ny.rustdesk.com/${SERVER}/g" libs/hbb_common/src/config.rs
+          sed -i.bak "s|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${KEY}|g" libs/hbb_common/src/config.rs
+          rm -f libs/hbb_common/src/config.rs.bak
 
       - name: Install flutter
         uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
@@ -715,8 +718,9 @@ jobs:
         run: |
           SERVER="${RENDEZVOUS_SERVER:-rs-ny.rustdesk.com}"
           KEY="${RS_PUB_KEY:-OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=}"
-          sed -i "s/rs-ny.rustdesk.com/${SERVER}/g" libs/hbb_common/src/config.rs
-          sed -i "s|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${KEY}|g" libs/hbb_common/src/config.rs
+          sed -i.bak "s/rs-ny.rustdesk.com/${SERVER}/g" libs/hbb_common/src/config.rs
+          sed -i.bak "s|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${KEY}|g" libs/hbb_common/src/config.rs
+          rm -f libs/hbb_common/src/config.rs.bak
 
       - name: Import the codesign cert
         if: env.MACOS_P12_BASE64 != null
@@ -1039,8 +1043,9 @@ jobs:
         run: |
           SERVER="${RENDEZVOUS_SERVER:-rs-ny.rustdesk.com}"
           KEY="${RS_PUB_KEY:-OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=}"
-          sed -i "s/rs-ny.rustdesk.com/${SERVER}/g" libs/hbb_common/src/config.rs
-          sed -i "s|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${KEY}|g" libs/hbb_common/src/config.rs
+          sed -i.bak "s/rs-ny.rustdesk.com/${SERVER}/g" libs/hbb_common/src/config.rs
+          sed -i.bak "s|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${KEY}|g" libs/hbb_common/src/config.rs
+          rm -f libs/hbb_common/src/config.rs.bak
 
       - name: Install flutter
         uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
@@ -1322,8 +1327,9 @@ jobs:
         run: |
           SERVER="${RENDEZVOUS_SERVER:-rs-ny.rustdesk.com}"
           KEY="${RS_PUB_KEY:-OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=}"
-          sed -i "s/rs-ny.rustdesk.com/${SERVER}/g" libs/hbb_common/src/config.rs
-          sed -i "s|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${KEY}|g" libs/hbb_common/src/config.rs
+          sed -i.bak "s/rs-ny.rustdesk.com/${SERVER}/g" libs/hbb_common/src/config.rs
+          sed -i.bak "s|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${KEY}|g" libs/hbb_common/src/config.rs
+          rm -f libs/hbb_common/src/config.rs.bak
 
       - name: Install flutter
         uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
@@ -1498,8 +1504,9 @@ jobs:
         run: |
           SERVER="${RENDEZVOUS_SERVER:-rs-ny.rustdesk.com}"
           KEY="${RS_PUB_KEY:-OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=}"
-          sed -i "s/rs-ny.rustdesk.com/${SERVER}/g" libs/hbb_common/src/config.rs
-          sed -i "s|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${KEY}|g" libs/hbb_common/src/config.rs
+          sed -i.bak "s/rs-ny.rustdesk.com/${SERVER}/g" libs/hbb_common/src/config.rs
+          sed -i.bak "s|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${KEY}|g" libs/hbb_common/src/config.rs
+          rm -f libs/hbb_common/src/config.rs.bak
 
       - name: Set Swap Space
         if: ${{ matrix.job.arch == 'x86_64' }}
@@ -1839,8 +1846,9 @@ jobs:
         run: |
           SERVER="${RENDEZVOUS_SERVER:-rs-ny.rustdesk.com}"
           KEY="${RS_PUB_KEY:-OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=}"
-          sed -i "s/rs-ny.rustdesk.com/${SERVER}/g" libs/hbb_common/src/config.rs
-          sed -i "s|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${KEY}|g" libs/hbb_common/src/config.rs
+          sed -i.bak "s/rs-ny.rustdesk.com/${SERVER}/g" libs/hbb_common/src/config.rs
+          sed -i.bak "s|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${KEY}|g" libs/hbb_common/src/config.rs
+          rm -f libs/hbb_common/src/config.rs.bak
 
       - name: Modify vcpkg.json for armv7
         if: matrix.job.vcpkg-triplet == 'arm-linux'
@@ -2052,8 +2060,9 @@ jobs:
         run: |
           SERVER="${RENDEZVOUS_SERVER:-rs-ny.rustdesk.com}"
           KEY="${RS_PUB_KEY:-OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=}"
-          sed -i "s/rs-ny.rustdesk.com/${SERVER}/g" libs/hbb_common/src/config.rs
-          sed -i "s|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${KEY}|g" libs/hbb_common/src/config.rs
+          sed -i.bak "s/rs-ny.rustdesk.com/${SERVER}/g" libs/hbb_common/src/config.rs
+          sed -i.bak "s|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${KEY}|g" libs/hbb_common/src/config.rs
+          rm -f libs/hbb_common/src/config.rs.bak
 
       - name: Download Binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -2137,8 +2146,9 @@ jobs:
         run: |
           SERVER="${RENDEZVOUS_SERVER:-rs-ny.rustdesk.com}"
           KEY="${RS_PUB_KEY:-OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=}"
-          sed -i "s/rs-ny.rustdesk.com/${SERVER}/g" libs/hbb_common/src/config.rs
-          sed -i "s|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${KEY}|g" libs/hbb_common/src/config.rs
+          sed -i.bak "s/rs-ny.rustdesk.com/${SERVER}/g" libs/hbb_common/src/config.rs
+          sed -i.bak "s|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${KEY}|g" libs/hbb_common/src/config.rs
+          rm -f libs/hbb_common/src/config.rs.bak
 
       - name: Download Binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -2209,8 +2219,9 @@ jobs:
         run: |
           SERVER="${RENDEZVOUS_SERVER:-rs-ny.rustdesk.com}"
           KEY="${RS_PUB_KEY:-OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=}"
-          sed -i "s/rs-ny.rustdesk.com/${SERVER}/g" libs/hbb_common/src/config.rs
-          sed -i "s|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${KEY}|g" libs/hbb_common/src/config.rs
+          sed -i.bak "s/rs-ny.rustdesk.com/${SERVER}/g" libs/hbb_common/src/config.rs
+          sed -i.bak "s|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${KEY}|g" libs/hbb_common/src/config.rs
+          rm -f libs/hbb_common/src/config.rs.bak
 
       - name: Prepare env
         run: |
