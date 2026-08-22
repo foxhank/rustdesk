@@ -56,9 +56,11 @@ jobs:
             exit 1
           fi
 
-      - name: cargo check (whole workspace)
+      - name: cargo check (default features; the flutter feature needs the
+          FRB-generated bridge files, which the full flutter-tag build
+          produces)
         shell: bash
-        run: cargo check --features flutter 2>&1 | tail -100
+        run: cargo check 2>&1 | tail -100
 
       - name: cargo test hbb_common
         shell: bash
