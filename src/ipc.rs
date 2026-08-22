@@ -154,6 +154,7 @@ pub enum FS {
         overwrite_detection: bool,
         total_size: u64,
         conn_id: i32,
+        enable_rsync: bool,
     },
     CancelWrite {
         id: i32,
@@ -201,6 +202,7 @@ pub enum FS {
         include_hidden: bool,
         conn_id: i32,
         overwrite_detection: bool,
+        enable_rsync: bool,
     },
     CancelRead {
         id: i32,
@@ -218,6 +220,58 @@ pub enum FS {
         id: i32,
         include_hidden: bool,
         conn_id: i32,
+    },
+    // ---- rsync incremental transfer (Connection -> CM) ----
+    // Download direction (CM read job = new-file side): client's signature.
+    RsyncMetaToRead {
+        id: i32,
+        file_num: i32,
+        old_file_size: u64,
+        block_size: u32,
+        sig_len: u64,
+        num_chunks: u32,
+        conn_id: i32,
+    },
+    RsyncChunkToRead {
+        id: i32,
+        file_num: i32,
+        chunk_index: u32,
+        compressed: bool,
+        conn_id: i32,
+        #[serde(skip)]
+        data: Bytes,
+    },
+    RsyncFallbackToRead {
+        id: i32,
+        file_num: i32,
+        conn_id: i32,
+    },
+    RsyncAckToRead {
+        id: i32,
+        file_num: i32,
+        conn_id: i32,
+    },
+    // Upload direction (CM write job = old-file side): client's delta.
+    RsyncDeltaMetaToWrite {
+        id: i32,
+        file_num: i32,
+        new_file_size: u64,
+        delta_len: u64,
+        num_chunks: u32,
+        sha256: Vec<u8>,
+        last_modified: u64,
+    },
+    RsyncChunkToWrite {
+        id: i32,
+        file_num: i32,
+        chunk_index: u32,
+        compressed: bool,
+        #[serde(skip)]
+        data: Bytes,
+    },
+    RsyncFallbackToWrite {
+        id: i32,
+        file_num: i32,
     },
 }
 
@@ -427,6 +481,21 @@ pub enum Data {
     FileReadDone {
         id: i32,
         file_num: i32,
+        conn_id: i32,
+    },
+    /// Rsync chunk (delta or signature) read/produced by CM.
+    ///
+    /// Same raw-frame protocol as `FileBlockFromCM`: sender sends this
+    /// message with empty `data` followed by `send_raw(data)`; receiver
+    /// rehydrates via `next_raw()`.
+    RsyncChunkFromCM {
+        id: i32,
+        file_num: i32,
+        chunk_index: u32,
+        is_delta: bool,
+        compressed: bool,
+        #[serde(skip)]
+        data: bytes::Bytes,
         conn_id: i32,
     },
     /// File read failed with error

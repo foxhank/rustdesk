@@ -27,6 +27,7 @@ use crossbeam_queue::ArrayQueue;
 use hbb_common::tokio::sync::mpsc::error::TryRecvError;
 use hbb_common::{
     allow_err,
+    anyhow,
     config::{self, LocalConfig, PeerConfig, TransferSerde},
     fs::{
         self, can_enable_overwrite_detection, get_job, get_string, new_send_confirm,
@@ -596,8 +597,8 @@ impl<T: InvokeUiSession> Remote<T> {
                 }
                 allow_err!(peer.send(&msg).await);
             }
-            Data::SendFiles((id, r#type, path, to, file_num, include_hidden, is_remote)) => {
-                log::info!("send files, is remote {}", is_remote);
+            Data::SendFiles((id, r#type, path, to, file_num, include_hidden, is_remote, enable_rsync)) => {
+                log::info!("send files, is remote {}, rsync {}", is_remote, enable_rsync);
                 let od = can_enable_overwrite_detection(self.handler.lc.read().unwrap().version);
                 if is_remote {
                     log::debug!("New job {}, write to {} from remote {}", id, to, path);
@@ -607,7 +608,7 @@ impl<T: InvokeUiSession> Remote<T> {
                             fs::DataSource::MemoryCursor(std::io::Cursor::new(Vec::new()))
                         }
                     };
-                    self.write_jobs.push(fs::TransferJob::new_write(
+                    let mut job = fs::TransferJob::new_write(
                         id,
                         r#type,
                         path.clone(),
@@ -616,10 +617,19 @@ impl<T: InvokeUiSession> Remote<T> {
                         include_hidden,
                         is_remote,
                         od,
-                    ));
+                    );
+                    job.set_rsync_enabled(enable_rsync);
+                    self.write_jobs.push(job);
                     allow_err!(
-                        peer.send(&fs::new_send(id, r#type, path, file_num, include_hidden))
-                            .await
+                        peer.send(&fs::new_send(
+                            id,
+                            r#type,
+                            path,
+                            file_num,
+                            include_hidden,
+                            enable_rsync
+                        ))
+                        .await
                     );
                 } else {
                     match fs::TransferJob::new_read(
@@ -635,7 +645,7 @@ impl<T: InvokeUiSession> Remote<T> {
                         Err(err) => {
                             self.handle_job_status(id, -1, Some(err.to_string()));
                         }
-                        Ok(job) => {
+                        Ok(mut job) => {
                             log::debug!(
                                 "New job {}, read {} to remote {}, {} files",
                                 id,
@@ -643,6 +653,7 @@ impl<T: InvokeUiSession> Remote<T> {
                                 to,
                                 job.files().len()
                             );
+                            job.set_rsync_enabled(enable_rsync);
                             self.handler.update_folder_files(
                                 job.id(),
                                 job.files(),
@@ -663,14 +674,21 @@ impl<T: InvokeUiSession> Remote<T> {
                             self.read_jobs.push(job);
                             self.timer = crate::rustdesk_interval(time::interval(MILLI1));
                             allow_err!(
-                                peer.send(&fs::new_receive(id, to, file_num, files, total_size))
-                                    .await
+                                peer.send(&fs::new_receive(
+                                    id,
+                                    to,
+                                    file_num,
+                                    files,
+                                    total_size,
+                                    enable_rsync
+                                ))
+                                .await
                             );
                         }
                     }
                 }
             }
-            Data::AddJob((id, r#type, path, to, file_num, include_hidden, is_remote)) => {
+            Data::AddJob((id, r#type, path, to, file_num, include_hidden, is_remote, enable_rsync)) => {
                 let od = can_enable_overwrite_detection(self.handler.lc.read().unwrap().version);
                 if is_remote {
                     log::debug!(
@@ -689,6 +707,7 @@ impl<T: InvokeUiSession> Remote<T> {
                         is_remote,
                         od,
                     );
+                    job.set_rsync_enabled(enable_rsync);
                     job.is_last_job = true;
                     self.write_jobs.push(job);
                 } else {
@@ -713,6 +732,7 @@ impl<T: InvokeUiSession> Remote<T> {
                                 to,
                                 job.files().len()
                             );
+                            job.set_rsync_enabled(enable_rsync);
                             self.handler.update_folder_files(
                                 job.id(),
                                 job.files(),
@@ -738,7 +758,8 @@ impl<T: InvokeUiSession> Remote<T> {
                                 fs::JobType::Generic,
                                 job.remote.clone(),
                                 job.file_num,
-                                job.show_hidden
+                                job.show_hidden,
+                                job.rsync_enabled()
                             ))
                             .await
                         );
@@ -766,6 +787,7 @@ impl<T: InvokeUiSession> Remote<T> {
                                         job.file_num,
                                         files,
                                         job.total_size(),
+                                        job.rsync_enabled()
                                     ))
                                     .await
                                 );
@@ -814,6 +836,7 @@ impl<T: InvokeUiSession> Remote<T> {
                         .await;
                     }
                 } else {
+                    let mut need_rsync_action = false;
                     if let Some(job) = fs::get_job(id, &mut self.write_jobs) {
                         if remember {
                             job.set_overwrite_strategy(Some(need_override));
@@ -834,6 +857,12 @@ impl<T: InvokeUiSession> Remote<T> {
                         file_action.set_send_confirm(req);
                         msg.set_file_action(file_action);
                         allow_err!(peer.send(&msg).await);
+                        // Overwrite (OffsetBlk(0)) may enter rsync mode: this
+                        // side holds the old file and must send its signature.
+                        need_rsync_action = need_override;
+                    }
+                    if need_rsync_action {
+                        self.process_rsync_confirm_action(id, peer).await;
                     }
                 }
             }
@@ -1082,6 +1111,216 @@ impl<T: InvokeUiSession> Remote<T> {
         }
         let _ = fs::remove_job(id, &mut self.read_jobs);
         self.remove_jobs.remove(&id);
+    }
+
+    // ---- rsync incremental transfer (client side) ----
+
+    /// After an overwrite confirm on a local WRITE job (download direction:
+    /// this side holds the old file), produce the signature or tell the peer
+    /// to fall back.
+    async fn process_rsync_confirm_action(&mut self, id: i32, peer: &mut Stream) {
+        let (action, file_num, sig_path) = {
+            let Some(job) = fs::get_job(id, &mut self.write_jobs) else {
+                return;
+            };
+            (
+                job.take_rsync_confirm_action(),
+                job.file_num(),
+                job.rsync_signature_path(),
+            )
+        };
+        match action {
+            fs::RsyncConfirmAction::Nothing => {}
+            fs::RsyncConfirmAction::SendFallback => {
+                log::info!("job {}: rsync declined (old file missing)", id);
+                allow_err!(
+                    peer.send(&fs::new_rsync_fallback_action(id, file_num, "old file missing"))
+                        .await
+                );
+            }
+            fs::RsyncConfirmAction::ComputeSignature => {
+                let Some(path) = sig_path else {
+                    return;
+                };
+                let sig_result =
+                    tokio::task::spawn_blocking(move || fs::rsync::signature_from_file(&path))
+                        .await;
+                match sig_result.unwrap_or_else(|e| Err(anyhow::anyhow!("{}", e))) {
+                    Ok((sig, info)) => {
+                        log::info!(
+                            "job {}: rsync signature ready, {} bytes, {} chunks",
+                            id,
+                            info.sig_len,
+                            info.num_chunks
+                        );
+                        allow_err!(
+                            peer.send(&fs::new_rsync_meta_action(FileTransferRsyncMeta {
+                                id,
+                                file_num,
+                                old_file_size: info.old_file_size,
+                                block_size: info.block_size,
+                                sig_len: info.sig_len,
+                                num_chunks: info.num_chunks,
+                                ..Default::default()
+                            }))
+                            .await
+                        );
+                        for (i, (data, compressed)) in
+                            fs::rsync::signature_to_chunks(&sig).into_iter().enumerate()
+                        {
+                            let chunk = FileTransferRsyncChunk {
+                                id,
+                                file_num,
+                                chunk_index: i as u32,
+                                is_delta: false,
+                                compressed,
+                                data: data.into(),
+                                ..Default::default()
+                            };
+                            allow_err!(peer.send(&fs::new_rsync_chunk_action(chunk)).await);
+                        }
+                        if let Some(job) = fs::get_job(id, &mut self.write_jobs) {
+                            job.rsync_signature_sent();
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("job {}: rsync signature failed: {}", id, e);
+                        allow_err!(
+                            peer.send(&fs::new_rsync_fallback_action(id, file_num, &e.to_string()))
+                                .await
+                        );
+                        if let Some(job) = fs::get_job(id, &mut self.write_jobs) {
+                            job.rsync_fallback_local().await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The local READ job's signature intake completed (upload direction):
+    /// diff the new file against it and either start streaming the delta or
+    /// fall back.
+    async fn handle_rsync_diff(&mut self, id: i32, sig_bytes: Vec<u8>, peer: &mut Stream) {
+        let (new_file, spool, file_num) = {
+            let Some(job) = fs::get_job(id, &mut self.read_jobs) else {
+                return;
+            };
+            match (job.rsync_new_file_path(), job.rsync_delta_spool_path()) {
+                (Some(n), Some(s)) => (n, s, job.file_num()),
+                _ => return,
+            }
+        };
+        let diff_result = tokio::task::spawn_blocking(move || {
+            fs::rsync::diff_to_spool(&new_file, &sig_bytes, &spool)
+        })
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("{}", e)));
+        let too_big = |info: &fs::rsync::DeltaInfo| {
+            info.delta_len >= std::cmp::min(info.new_file_size, fs::rsync::MAX_DELTA_BYTES)
+        };
+        let fallback = |this: &mut Self, reason: String| async move {
+            log::warn!("job {}: rsync diff fallback: {}", id, reason);
+            if let Some(job) = fs::get_job(id, &mut this.read_jobs) {
+                job.rsync_fallback_local().await;
+            }
+        };
+        match diff_result {
+            Ok(info) if too_big(&info) => {
+                let reason = format!(
+                    "delta {} >= threshold (file {})",
+                    info.delta_len, info.new_file_size
+                );
+                allow_err!(
+                    peer.send(&fs::new_rsync_fallback_action(id, file_num, &reason))
+                        .await
+                );
+                fallback(self, reason).await;
+            }
+            Ok(info) => {
+                let started = fs::get_job(id, &mut self.read_jobs)
+                    .map(|job| job.begin_sending_delta(&spool, info.clone()).is_ok())
+                    .unwrap_or(false);
+                if started {
+                    log::info!(
+                        "job {}: rsync delta ready, {} bytes vs file {} bytes",
+                        id,
+                        info.delta_len,
+                        info.new_file_size
+                    );
+                    allow_err!(
+                        peer.send(&fs::new_rsync_delta_meta_action(
+                            FileTransferRsyncDeltaMeta {
+                                id,
+                                file_num,
+                                new_file_size: info.new_file_size,
+                                delta_len: info.delta_len,
+                                num_chunks: info.num_chunks,
+                                sha256: info.sha256_new.to_vec().into(),
+                                last_modified: info.last_modified,
+                                ..Default::default()
+                            }
+                        ))
+                        .await
+                    );
+                } else {
+                    let reason = "failed to open delta spool".to_string();
+                    allow_err!(
+                        peer.send(&fs::new_rsync_fallback_action(id, file_num, &reason))
+                            .await
+                    );
+                    fallback(self, reason).await;
+                }
+            }
+            Err(e) => {
+                allow_err!(
+                    peer.send(&fs::new_rsync_fallback_action(id, file_num, &e.to_string()))
+                        .await
+                );
+                fallback(self, e.to_string()).await;
+            }
+        }
+    }
+
+    /// The local WRITE job's delta intake completed (download direction):
+    /// apply + verify, then ack or fall back.
+    async fn handle_rsync_apply(&mut self, id: i32, params: fs::RsyncApplyParams, peer: &mut Stream) {
+        let file_num = {
+            let Some(job) = fs::get_job(id, &mut self.write_jobs) else {
+                return;
+            };
+            job.file_num()
+        };
+        let apply_result = tokio::task::spawn_blocking(move || {
+            fs::rsync::apply_and_verify(
+                &params.old_file,
+                &params.delta,
+                &params.out_file,
+                params.new_file_size,
+                &params.sha256,
+            )
+        })
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("{}", e)));
+        match apply_result {
+            Ok(()) => {
+                log::info!("job {}: rsync apply verified ok", id);
+                if let Some(job) = fs::get_job(id, &mut self.write_jobs) {
+                    job.rsync_finish();
+                }
+                allow_err!(peer.send(&fs::new_rsync_ack_action(id, file_num)).await);
+            }
+            Err(e) => {
+                log::warn!("job {}: rsync apply failed: {}", id, e);
+                allow_err!(
+                    peer.send(&fs::new_rsync_fallback_action(id, file_num, &e.to_string()))
+                        .await
+                );
+                if let Some(job) = fs::get_job(id, &mut self.write_jobs) {
+                    job.rsync_fallback_local().await;
+                }
+            }
+        }
     }
 
     pub async fn sync_jobs_status_to_local(&mut self) -> bool {
@@ -1616,6 +1855,7 @@ impl<T: InvokeUiSession> Remote<T> {
                                     }
                                 }
                             } else {
+                                let mut need_rsync_action = false;
                                 if let Some(job) = fs::get_job(digest.id, &mut self.write_jobs) {
                                     if let Some(file) = job.files().get(digest.file_num as usize) {
                                         if let fs::DataSource::FilePath(p) = &job.data_source {
@@ -1671,6 +1911,9 @@ impl<T: InvokeUiSession> Remote<T> {
                                                             job.confirm(&req).await;
                                                             let msg = new_send_confirm(req);
                                                             allow_err!(peer.send(&msg).await);
+                                                            if overwrite && offset == 0 {
+                                                                need_rsync_action = true;
+                                                            }
                                                         } else {
                                                             self.handler.override_file_confirm(
                                                                 digest.id,
@@ -1691,6 +1934,7 @@ impl<T: InvokeUiSession> Remote<T> {
                                                         job.confirm(&req).await;
                                                         let msg = new_send_confirm(req);
                                                         allow_err!(peer.send(&msg).await);
+                                                        need_rsync_action = true;
                                                     }
                                                 },
                                                 Err(err) => {
@@ -1699,6 +1943,9 @@ impl<T: InvokeUiSession> Remote<T> {
                                             }
                                         }
                                     }
+                                }
+                                if need_rsync_action {
+                                    self.process_rsync_confirm_action(digest.id, peer).await;
                                 }
                             }
                         }
@@ -1710,6 +1957,106 @@ impl<T: InvokeUiSession> Remote<T> {
                                 if job.r#type == fs::JobType::Generic {
                                     self.update_jobs_status();
                                 }
+                            }
+                        }
+                        Some(file_response::Union::RsyncMeta(m)) => {
+                            // Upload direction: server sent the old-file signature.
+                            if let Some(job) = fs::get_job(m.id, &mut self.read_jobs) {
+                                job.on_rsync_meta(&m);
+                            }
+                        }
+                        Some(file_response::Union::RsyncDeltaMeta(m)) => {
+                            // Download direction: server will stream its delta.
+                            let mut err: Option<String> = None;
+                            if let Some(job) = fs::get_job(m.id, &mut self.write_jobs) {
+                                if let Err(e) = job.on_rsync_delta_meta(&m) {
+                                    err = Some(e.to_string());
+                                }
+                            }
+                            if let Some(e) = err {
+                                allow_err!(
+                                    peer.send(&fs::new_rsync_fallback_action(m.id, m.file_num, &e))
+                                        .await
+                                );
+                                if let Some(job) = fs::get_job(m.id, &mut self.write_jobs) {
+                                    job.rsync_fallback_local().await;
+                                }
+                            }
+                        }
+                        Some(file_response::Union::RsyncChunk(c)) => {
+                            if c.is_delta {
+                                // Download: delta for the local write job.
+                                let mut apply_params = None;
+                                let mut err: Option<String> = None;
+                                if let Some(job) = fs::get_job(c.id, &mut self.write_jobs) {
+                                    match job.on_rsync_delta_chunk(&c) {
+                                        Ok(p) => apply_params = p,
+                                        Err(e) => err = Some(e.to_string()),
+                                    }
+                                }
+                                if let Some(params) = apply_params {
+                                    self.handle_rsync_apply(c.id, params, peer).await;
+                                }
+                                if let Some(e) = err {
+                                    log::warn!("job {}: rsync delta chunk error: {}", c.id, e);
+                                    allow_err!(
+                                        peer.send(&fs::new_rsync_fallback_action(
+                                            c.id,
+                                            c.file_num,
+                                            &e
+                                        ))
+                                        .await
+                                    );
+                                    if let Some(job) = fs::get_job(c.id, &mut self.write_jobs) {
+                                        job.rsync_fallback_local().await;
+                                    }
+                                }
+                            } else {
+                                // Upload: signature chunks for the local read job.
+                                let mut sig_done: Option<Vec<u8>> = None;
+                                let mut err: Option<String> = None;
+                                if let Some(job) = fs::get_job(c.id, &mut self.read_jobs) {
+                                    match job.on_rsync_sig_chunk(&c) {
+                                        Ok(s) => sig_done = s,
+                                        Err(e) => err = Some(e.to_string()),
+                                    }
+                                }
+                                if let Some(sig) = sig_done {
+                                    self.handle_rsync_diff(c.id, sig, peer).await;
+                                }
+                                if let Some(e) = err {
+                                    log::warn!("job {}: rsync sig chunk error: {}", c.id, e);
+                                    allow_err!(
+                                        peer.send(&fs::new_rsync_fallback_action(
+                                            c.id,
+                                            c.file_num,
+                                            &e
+                                        ))
+                                        .await
+                                    );
+                                    if let Some(job) = fs::get_job(c.id, &mut self.read_jobs) {
+                                        job.rsync_fallback_local().await;
+                                    }
+                                }
+                            }
+                        }
+                        Some(file_response::Union::RsyncFallback(f)) => {
+                            log::info!(
+                                "job {}: peer rsync fallback: {}",
+                                f.id,
+                                f.reason
+                            );
+                            if let Some(job) = fs::get_job(f.id, &mut self.read_jobs) {
+                                job.rsync_fallback_local().await;
+                            }
+                            if let Some(job) = fs::get_job(f.id, &mut self.write_jobs) {
+                                job.rsync_fallback_local().await;
+                            }
+                        }
+                        Some(file_response::Union::RsyncAck(a)) => {
+                            // Upload: server applied our delta; advance the file.
+                            if let Some(job) = fs::get_job(a.id, &mut self.read_jobs) {
+                                job.on_rsync_ack();
                             }
                         }
                         Some(file_response::Union::Done(d)) => {

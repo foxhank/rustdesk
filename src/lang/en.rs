@@ -20,6 +20,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Connection Error", "Connection error"),
         ("Login Error", "Login error"),
         ("Show Hidden Files", "Show hidden files"),
+        ("Incremental Transfer (rsync)", "Incremental transfer (rsync)"),
         ("Refresh File", "Refresh file"),
         ("Remote Computer", "Remote computer"),
         ("Local Computer", "Local computer"),

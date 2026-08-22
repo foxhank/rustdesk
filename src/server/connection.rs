@@ -914,6 +914,20 @@ impl Connection {
                                 conn.handle_file_block_from_cm(id, file_num, data, compressed).await;
                             }
                         }
+                        ipc::Data::RsyncChunkFromCM { id, file_num, chunk_index, is_delta, compressed, data, conn_id } => {
+                            if conn_id == conn.inner.id() {
+                                let chunk = FileTransferRsyncChunk {
+                                    id,
+                                    file_num,
+                                    chunk_index,
+                                    is_delta,
+                                    compressed,
+                                    data,
+                                    ..Default::default()
+                                };
+                                conn.send(fs::new_rsync_chunk_response(chunk)).await;
+                            }
+                        }
                         ipc::Data::FileReadDone { id, file_num, conn_id } => {
                             if conn_id == conn.inner.id() {
                                 conn.handle_file_read_done(id, file_num).await;
@@ -3344,6 +3358,7 @@ impl Connection {
                                                 include_hidden: s.include_hidden,
                                                 conn_id: self.inner.id(),
                                                 overwrite_detection: od,
+                                                enable_rsync: s.enable_rsync,
                                             });
                                         } else {
                                             // Handle file reading in Connection on non-Windows
@@ -3358,6 +3373,7 @@ impl Connection {
                                                 od,
                                                 path,
                                                 true, // check file count limit
+                                                s.enable_rsync,
                                             )
                                             .await;
                                         }
@@ -3382,6 +3398,7 @@ impl Connection {
                                                 true, // always enable overwrite detection for printer
                                                 path,
                                                 false, // no file count limit for printer
+                                                false, // no rsync for printer
                                             )
                                             .await;
                                         } else {
@@ -3412,6 +3429,7 @@ impl Connection {
                                     overwrite_detection: od,
                                     total_size: r.total_size,
                                     conn_id: self.inner.id(),
+                                    enable_rsync: r.enable_rsync,
                                 });
                                 self.post_file_audit(
                                     FileAuditType::RemoteReceive,
@@ -3461,6 +3479,8 @@ impl Connection {
                                     conn_id: self.inner.id(),
                                 });
                                 if let Some(job) = fs::remove_job(c.id, &mut self.read_jobs) {
+                                    // Also removes a stale rsync delta spool if any.
+                                    job.remove_download_file();
                                     self.send_to_cm(ipc::Data::FileTransferLog((
                                         "transfer".to_string(),
                                         fs::serialize_transfer_job(&job, false, true, ""),
@@ -3483,6 +3503,138 @@ impl Connection {
                                     if let Ok(sc) = r.write_to_bytes() {
                                         self.send_fs(ipc::FS::SendConfirm(sc));
                                     }
+                                }
+                            }
+                            Some(file_action::Union::RsyncMeta(m)) => {
+                                // Download direction: client sends the old-file
+                                // signature to the server's read job.
+                                if let Some(job) = fs::get_job(m.id, &mut self.read_jobs) {
+                                    job.on_rsync_meta(&m);
+                                } else if self.cm_read_job_ids.contains(&m.id) {
+                                    self.send_fs(ipc::FS::RsyncMetaToRead {
+                                        id: m.id,
+                                        file_num: m.file_num,
+                                        old_file_size: m.old_file_size,
+                                        block_size: m.block_size,
+                                        sig_len: m.sig_len,
+                                        num_chunks: m.num_chunks,
+                                        conn_id: self.inner.id(),
+                                    });
+                                }
+                            }
+                            Some(file_action::Union::RsyncDeltaMeta(m)) => {
+                                // Upload direction: client streams its delta to
+                                // the CM write job.
+                                self.send_fs(ipc::FS::RsyncDeltaMetaToWrite {
+                                    id: m.id,
+                                    file_num: m.file_num,
+                                    new_file_size: m.new_file_size,
+                                    delta_len: m.delta_len,
+                                    num_chunks: m.num_chunks,
+                                    sha256: m.sha256.to_vec(),
+                                    last_modified: m.last_modified,
+                                });
+                            }
+                            Some(file_action::Union::RsyncChunk(c)) => {
+                                if c.is_delta {
+                                    self.send_fs(ipc::FS::RsyncChunkToWrite {
+                                        id: c.id,
+                                        file_num: c.file_num,
+                                        chunk_index: c.chunk_index,
+                                        compressed: c.compressed,
+                                        data: c.data,
+                                    });
+                                } else if self.read_jobs.iter().any(|j| j.id() == c.id) {
+                                    // Local read job (non-Windows): feed the
+                                    // signature chunk; on completion run the
+                                    // blocking diff inline (file connections
+                                    // have no video traffic; remote-control
+                                    // sessions only stall file messages).
+                                    let mut sig_done: Option<Vec<u8>> = None;
+                                    let mut err: Option<String> = None;
+                                    if let Some(job) = fs::get_job(c.id, &mut self.read_jobs) {
+                                        match job.on_rsync_sig_chunk(&c) {
+                                            Ok(s) => sig_done = s,
+                                            Err(e) => err = Some(e.to_string()),
+                                        }
+                                    }
+                                    if let Some(e) = err {
+                                        log::warn!("job {}: rsync sig chunk error: {}", c.id, e);
+                                        if let Some(job) = fs::get_job(c.id, &mut self.read_jobs) {
+                                            job.rsync_fallback_local().await;
+                                        }
+                                        self.send(fs::new_rsync_fallback_response(
+                                            c.id,
+                                            c.file_num,
+                                            &e,
+                                        ))
+                                        .await;
+                                    }
+                                    if let Some(sig) = sig_done {
+                                        let paths = fs::get_job(c.id, &mut self.read_jobs).and_then(
+                                            |job| match (
+                                                job.rsync_new_file_path(),
+                                                job.rsync_delta_spool_path(),
+                                            ) {
+                                                (Some(n), Some(s)) => Some((n, s, job.file_num())),
+                                                _ => None,
+                                            },
+                                        );
+                                        if let Some((new_file, spool, file_num)) = paths {
+                                            let diff = tokio::task::spawn_blocking(move || {
+                                                fs::rsync::diff_to_spool(&new_file, &sig, &spool)
+                                            })
+                                            .await
+                                            .unwrap_or_else(|e| {
+                                                Err(hbb_common::anyhow::anyhow!("{}", e))
+                                            });
+                                            self.handle_local_rsync_diff(
+                                                c.id,
+                                                file_num,
+                                                diff,
+                                                &spool,
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                } else if self.cm_read_job_ids.contains(&c.id) {
+                                    self.send_fs(ipc::FS::RsyncChunkToRead {
+                                        id: c.id,
+                                        file_num: c.file_num,
+                                        chunk_index: c.chunk_index,
+                                        compressed: c.compressed,
+                                        conn_id: self.inner.id(),
+                                        data: c.data,
+                                    });
+                                }
+                            }
+                            Some(file_action::Union::RsyncFallback(f)) => {
+                                log::info!("job {}: client rsync fallback: {}", f.id, f.reason);
+                                if let Some(job) = fs::get_job(f.id, &mut self.read_jobs) {
+                                    job.rsync_fallback_local().await;
+                                } else if self.cm_read_job_ids.contains(&f.id) {
+                                    self.send_fs(ipc::FS::RsyncFallbackToRead {
+                                        id: f.id,
+                                        file_num: f.file_num,
+                                        conn_id: self.inner.id(),
+                                    });
+                                } else {
+                                    self.send_fs(ipc::FS::RsyncFallbackToWrite {
+                                        id: f.id,
+                                        file_num: f.file_num,
+                                    });
+                                }
+                            }
+                            Some(file_action::Union::RsyncAck(a)) => {
+                                // Download direction: client applied our delta.
+                                if let Some(job) = fs::get_job(a.id, &mut self.read_jobs) {
+                                    job.on_rsync_ack();
+                                } else if self.cm_read_job_ids.contains(&a.id) {
+                                    self.send_fs(ipc::FS::RsyncAckToRead {
+                                        id: a.id,
+                                        file_num: a.file_num,
+                                        conn_id: self.inner.id(),
+                                    });
                                 }
                             }
                             Some(file_action::Union::Rename(r)) => {
@@ -5232,6 +5384,7 @@ impl Connection {
         overwrite_detection: bool,
         path: String,
         check_file_limit: bool,
+        enable_rsync: bool,
     ) {
         match fs::TransferJob::new_read(
             id,
@@ -5246,7 +5399,7 @@ impl Connection {
             Err(err) => {
                 self.send(fs::new_error(id, err, 0)).await;
             }
-            Ok(job) => {
+            Ok(mut job) => {
                 if check_file_limit {
                     if let Err(msg) =
                         crate::ui_cm_interface::check_file_count_limit(job.files().len())
@@ -5255,7 +5408,71 @@ impl Connection {
                         return;
                     }
                 }
+                job.set_rsync_enabled(enable_rsync);
                 self.process_new_read_job(job, path).await;
+            }
+        }
+    }
+
+    /// Handle the diff result for a Connection-local read job (non-Windows):
+    /// start streaming the delta or revert to legacy transfer.
+    async fn handle_local_rsync_diff(
+        &mut self,
+        id: i32,
+        file_num: i32,
+        diff: hbb_common::ResultType<fs::rsync::DeltaInfo>,
+        spool: &std::path::Path,
+    ) {
+        let too_big = |info: &fs::rsync::DeltaInfo| {
+            info.delta_len >= std::cmp::min(info.new_file_size, fs::rsync::MAX_DELTA_BYTES)
+        };
+        let fallback = |this: &mut Self, reason: String| async move {
+            if let Some(job) = fs::get_job(id, &mut this.read_jobs) {
+                job.rsync_fallback_local().await;
+            }
+            this.send(fs::new_rsync_fallback_response(id, file_num, &reason))
+                .await;
+        };
+        match diff {
+            Ok(info) if too_big(&info) => {
+                let reason = format!(
+                    "delta {} >= threshold (file {})",
+                    info.delta_len, info.new_file_size
+                );
+                log::info!("job {}: rsync {}", id, reason);
+                fallback(self, reason).await;
+            }
+            Ok(info) => {
+                let started = fs::get_job(id, &mut self.read_jobs)
+                    .map(|job| job.begin_sending_delta(spool, info.clone()).is_ok())
+                    .unwrap_or(false);
+                if started {
+                    log::info!(
+                        "job {}: rsync delta ready, {} bytes vs file {} bytes",
+                        id,
+                        info.delta_len,
+                        info.new_file_size
+                    );
+                    self.send(fs::new_rsync_delta_meta_response(
+                        FileTransferRsyncDeltaMeta {
+                            id,
+                            file_num,
+                            new_file_size: info.new_file_size,
+                            delta_len: info.delta_len,
+                            num_chunks: info.num_chunks,
+                            sha256: info.sha256_new.to_vec().into(),
+                            last_modified: info.last_modified,
+                            ..Default::default()
+                        },
+                    ))
+                    .await;
+                } else {
+                    fallback(self, "failed to open delta spool".to_string()).await;
+                }
+            }
+            Err(e) => {
+                log::warn!("job {}: rsync diff failed: {}", id, e);
+                fallback(self, e.to_string()).await;
             }
         }
     }
@@ -6160,6 +6377,19 @@ async fn start_ipc(
                                     conn_id,
                                 })?;
                             }
+                            // RsyncChunkFromCM: same raw-frame protocol as FileBlockFromCM.
+                            ipc::Data::RsyncChunkFromCM { id, file_num, chunk_index, is_delta, compressed, data: _, conn_id } => {
+                                let raw_data = stream.next_raw().await?;
+                                tx_from_cm.send(ipc::Data::RsyncChunkFromCM {
+                                    id,
+                                    file_num,
+                                    chunk_index,
+                                    is_delta,
+                                    compressed,
+                                    data: raw_data.into(),
+                                    conn_id,
+                                })?;
+                            }
                             _ => {
                                 tx_from_cm.send(data)?;
                             }
@@ -6176,6 +6406,21 @@ async fn start_ipc(
                             data,
                             compressed}) = data {
                                 stream.send(&Data::FS(ipc::FS::WriteBlock{id, file_num, data: Bytes::new(), compressed})).await?;
+                                stream.send_raw(data).await?;
+                        } else if let Data::FS(ipc::FS::RsyncChunkToWrite{id,
+                            file_num,
+                            chunk_index,
+                            compressed,
+                            data}) = data {
+                                stream.send(&Data::FS(ipc::FS::RsyncChunkToWrite{id, file_num, chunk_index, compressed, data: Bytes::new()})).await?;
+                                stream.send_raw(data).await?;
+                        } else if let Data::FS(ipc::FS::RsyncChunkToRead{id,
+                            file_num,
+                            chunk_index,
+                            compressed,
+                            conn_id,
+                            data}) = data {
+                                stream.send(&Data::FS(ipc::FS::RsyncChunkToRead{id, file_num, chunk_index, compressed, conn_id, data: Bytes::new()})).await?;
                                 stream.send_raw(data).await?;
                         } else {
                             stream.send(&data).await?;

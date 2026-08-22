@@ -178,7 +178,7 @@ class JobTable: Reactor.Component {
                      conflict_batch_id: conflict_batch_id
                     });
     this.job_map[id] = this.jobs[this.jobs.length - 1];
-    handler.send_files(id, 0, path, to, 0, show_hidden, is_remote);
+    handler.send_files(id, 0, path, to, 0, show_hidden, is_remote, false);
     var self = this;
     self.timer(30ms, function() { self.update(); });
   }
@@ -192,7 +192,7 @@ class JobTable: Reactor.Component {
     this.jobs.push(job);
     this.job_map[id] = this.jobs[this.jobs.length - 1];
     handler.update_next_job_id(id + 1);
-    handler.add_job(id, 0, path, to, file_num, show_hidden, is_remote);
+    handler.add_job(id, 0, path, to, file_num, show_hidden, is_remote, false);
     if (auto_start) {
       this.continueJob(id);
       this.update();

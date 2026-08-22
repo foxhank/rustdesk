@@ -731,6 +731,7 @@ pub fn session_send_files(
     include_hidden: bool,
     is_remote: bool,
     _is_dir: bool,
+    enable_rsync: bool,
 ) {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
         session.send_files(
@@ -741,6 +742,7 @@ pub fn session_send_files(
             file_num,
             include_hidden,
             is_remote,
+            enable_rsync,
         );
     }
 }
@@ -864,6 +866,7 @@ pub fn session_add_job(
     file_num: i32,
     include_hidden: bool,
     is_remote: bool,
+    enable_rsync: bool,
 ) {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
         session.add_job(
@@ -874,6 +877,7 @@ pub fn session_add_job(
             file_num,
             include_hidden,
             is_remote,
+            enable_rsync,
         );
     }
 }

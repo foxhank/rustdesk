@@ -1,0 +1,47 @@
+name: CI Check
+
+# Lightweight compile/test validation (no flutter bundle, no vcpkg ffmpeg):
+# enough to type-check the whole workspace and run hbb_common unit tests.
+on:
+  workflow_dispatch:
+  push:
+    branches: [rsync-incremental]
+
+jobs:
+  check-windows:
+    runs-on: windows-latest
+    env:
+      VCPKG_DEFAULT_TRIPLET: x64-windows-static
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.75"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install LLVM (for bindgen in magnum-opus)
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "15.0.6"
+
+      - name: Setup vcpkg (opus only, classic mode)
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg C:/vcpkg-ci
+          C:/vcpkg-ci/bootstrap-vcpkg.bat -disableMetrics
+          C:/vcpkg-ci/vcpkg.exe install opus:x64-windows-static
+          echo "VCPKG_ROOT=C:/vcpkg-ci" >> "$GITHUB_ENV"
+
+      - name: cargo check (whole workspace)
+        shell: bash
+        run: cargo check --features flutter 2>&1 | tail -100
+
+      - name: cargo test hbb_common
+        shell: bash
+        run: cargo test -p hbb_common --lib 2>&1 | tail -50

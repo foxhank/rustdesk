@@ -988,6 +988,18 @@ class _FileManagerViewState extends State<FileManagerView> {
         padding: kDesktopMenuPadding,
         dismissOnClicked: true,
       ),
+      MenuEntrySwitch<String>(
+        switchType: SwitchType.scheckbox,
+        text: translate("Incremental Transfer (rsync)"),
+        getter: () async {
+          return controller.options.value.enableRsync;
+        },
+        setter: (bool v) async {
+          controller.toggleEnableRsync();
+        },
+        padding: kDesktopMenuPadding,
+        dismissOnClicked: true,
+      ),
       MenuEntryButton(
           childBuilder: (style) => Text(translate("Select All"), style: style),
           proc: () => setState(() =>

@@ -594,9 +594,26 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                                     }
                                 }
                                 Data::FS(mut fs) => {
-                                    if let ipc::FS::WriteBlock { id, file_num, data: _, compressed } = fs {
+                                    let needs_raw = matches!(
+                                        fs,
+                                        ipc::FS::WriteBlock { .. }
+                                            | ipc::FS::RsyncChunkToWrite { .. }
+                                            | ipc::FS::RsyncChunkToRead { .. }
+                                    );
+                                    if needs_raw {
                                         if let Ok(bytes) = self.stream.next_raw().await {
-                                            fs = ipc::FS::WriteBlock{id, file_num, data:bytes.into(), compressed};
+                                            match fs {
+                                                ipc::FS::WriteBlock { id, file_num, data: _, compressed } => {
+                                                    fs = ipc::FS::WriteBlock{id, file_num, data:bytes.into(), compressed};
+                                                }
+                                                ipc::FS::RsyncChunkToWrite { id, file_num, chunk_index, compressed, data: _ } => {
+                                                    fs = ipc::FS::RsyncChunkToWrite{id, file_num, chunk_index, compressed, data:bytes.into()};
+                                                }
+                                                ipc::FS::RsyncChunkToRead { id, file_num, chunk_index, compressed, conn_id, data: _ } => {
+                                                    fs = ipc::FS::RsyncChunkToRead{id, file_num, chunk_index, compressed, conn_id, data:bytes.into()};
+                                                }
+                                                _ => unreachable!(),
+                                            }
                                             handle_fs(fs, &mut write_jobs, &mut self.read_jobs, &self.tx, Some(&tx_log), self.conn_id).await;
                                         }
                                     } else {
@@ -731,6 +748,26 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                         }
                         if let Err(e) = self.stream.send_raw(data.clone()).await {
                             log::error!("error sending FileBlockFromCM data: {}", e);
+                            break;
+                        }
+                        continue;
+                    }
+                    // RsyncChunkFromCM: same raw-frame protocol as FileBlockFromCM.
+                    if let Data::RsyncChunkFromCM { id, file_num, chunk_index, is_delta, compressed, ref data, conn_id } = data {
+                        if let Err(e) = self.stream.send(&Data::RsyncChunkFromCM {
+                            id,
+                            file_num,
+                            chunk_index,
+                            is_delta,
+                            compressed,
+                            data: bytes::Bytes::new(), // placeholder, skipped by serde
+                            conn_id,
+                        }).await {
+                            log::error!("error sending RsyncChunkFromCM metadata: {}", e);
+                            break;
+                        }
+                        if let Err(e) = self.stream.send_raw(data.clone()).await {
+                            log::error!("error sending RsyncChunkFromCM data: {}", e);
                             break;
                         }
                         continue;
@@ -1002,6 +1039,7 @@ async fn handle_fs(
             overwrite_detection,
             total_size,
             conn_id,
+            enable_rsync,
         } => {
             // Convert files to FileEntry
             let file_entries: Vec<FileEntry> = files
@@ -1030,6 +1068,7 @@ async fn handle_fs(
                 send_raw(fs::new_error(id, e, file_num), tx);
                 return;
             }
+            job.set_rsync_enabled(enable_rsync);
             job.total_size = total_size;
             job.conn_id = conn_id;
             write_jobs.push(job);
@@ -1086,6 +1125,7 @@ async fn handle_fs(
             is_upload,
             is_resume,
         } => {
+            let mut need_rsync_action = false;
             if let Some(job) = fs::get_job(id, write_jobs) {
                 let mut req = FileTransferSendConfirmRequest {
                     id,
@@ -1122,8 +1162,15 @@ async fn handle_fs(
                                         send_raw(msg_out, &tx);
                                     }
                                     DigestCheckResult::NoSuchFile => {
-                                        let msg_out = new_send_confirm(req);
+                                        let msg_out = new_send_confirm(req.clone());
                                         send_raw(msg_out, &tx);
+                                        // Confirm the write job as well: this is
+                                        // an overwrite decision made on the
+                                        // server, and it lets the rsync state
+                                        // machine decline immediately (the old
+                                        // file does not exist).
+                                        job.confirm(&req).await;
+                                        need_rsync_action = true;
                                     }
                                 }
                             }
@@ -1134,12 +1181,18 @@ async fn handle_fs(
                     }
                 }
             }
+            if need_rsync_action {
+                process_cm_rsync_confirm_action(id, write_jobs, &tx).await;
+            }
         }
         ipc::FS::SendConfirm(bytes) => {
             if let Ok(r) = FileTransferSendConfirmRequest::parse_from_bytes(&bytes) {
                 if let Some(job) = fs::get_job(r.id, write_jobs) {
                     job.confirm(&r).await;
                 }
+                // An overwrite confirm may have armed rsync mode for the
+                // write job (this side holds the old file).
+                process_cm_rsync_confirm_action(r.id, write_jobs, &tx).await;
             }
         }
         ipc::FS::Rename { id, path, new_name } => {
@@ -1152,6 +1205,7 @@ async fn handle_fs(
             include_hidden,
             conn_id,
             overwrite_detection,
+            enable_rsync,
         } => {
             start_read_job(
                 path,
@@ -1160,10 +1214,170 @@ async fn handle_fs(
                 id,
                 conn_id,
                 overwrite_detection,
+                enable_rsync,
                 read_jobs,
                 tx,
             )
             .await;
+        }
+        // ---- rsync incremental transfer ----
+        // Download direction: the client's old-file signature for a CM read job.
+        ipc::FS::RsyncMetaToRead {
+            id,
+            file_num,
+            old_file_size: _,
+            block_size: _,
+            sig_len,
+            num_chunks,
+            conn_id: _,
+        } => {
+            if let Some(job) = fs::get_job(id, read_jobs) {
+                job.on_rsync_meta(&FileTransferRsyncMeta {
+                    id,
+                    file_num,
+                    sig_len,
+                    num_chunks,
+                    ..Default::default()
+                });
+            }
+        }
+        ipc::FS::RsyncChunkToRead {
+            id,
+            file_num,
+            chunk_index,
+            compressed,
+            conn_id: _,
+            data,
+        } => {
+            let chunk = FileTransferRsyncChunk {
+                id,
+                file_num,
+                chunk_index,
+                is_delta: false,
+                compressed,
+                data,
+                ..Default::default()
+            };
+            let mut sig_done: Option<Vec<u8>> = None;
+            let mut err: Option<String> = None;
+            if let Some(job) = fs::get_job(id, read_jobs) {
+                match job.on_rsync_sig_chunk(&chunk) {
+                    Ok(s) => sig_done = s,
+                    Err(e) => err = Some(e.to_string()),
+                }
+            }
+            if let Some(e) = err {
+                log::warn!("job {}: rsync sig chunk error: {}", id, e);
+                if let Some(job) = fs::get_job(id, read_jobs) {
+                    job.rsync_fallback_local().await;
+                }
+                send_raw(fs::new_rsync_fallback_response(id, file_num, &e), tx);
+            }
+            if let Some(sig) = sig_done {
+                let paths = {
+                    let Some(job) = fs::get_job(id, read_jobs) else {
+                        return;
+                    };
+                    match (job.rsync_new_file_path(), job.rsync_delta_spool_path()) {
+                        (Some(n), Some(s)) => Some((n, s)),
+                        _ => None,
+                    }
+                };
+                if let Some((new_file, spool)) = paths {
+                    let diff = spawn_blocking(move || fs::rsync::diff_to_spool(&new_file, &sig, &spool))
+                        .await
+                        .unwrap_or_else(|e| Err(hbb_common::anyhow::anyhow!("{}", e)));
+                    process_cm_rsync_diff(id, file_num, diff, &spool, read_jobs, tx).await;
+                }
+            }
+        }
+        ipc::FS::RsyncFallbackToRead {
+            id,
+            file_num,
+            conn_id: _,
+        } => {
+            log::info!("job {}: client rsync fallback (read)", id);
+            if let Some(job) = fs::get_job(id, read_jobs) {
+                job.rsync_fallback_local().await;
+            }
+        }
+        ipc::FS::RsyncAckToRead {
+            id,
+            file_num: _,
+            conn_id: _,
+        } => {
+            if let Some(job) = fs::get_job(id, read_jobs) {
+                job.on_rsync_ack();
+            }
+        }
+        // Upload direction: the client's delta for a CM write job.
+        ipc::FS::RsyncDeltaMetaToWrite {
+            id,
+            file_num,
+            new_file_size,
+            delta_len,
+            num_chunks,
+            sha256,
+            last_modified,
+        } => {
+            let meta = FileTransferRsyncDeltaMeta {
+                id,
+                file_num,
+                new_file_size,
+                delta_len,
+                num_chunks,
+                sha256: sha256.into(),
+                last_modified,
+                ..Default::default()
+            };
+            if let Some(job) = fs::get_job(id, write_jobs) {
+                if let Err(e) = job.on_rsync_delta_meta(&meta) {
+                    log::warn!("job {}: rsync delta meta error: {}", id, e);
+                    job.rsync_fallback_local().await;
+                    send_raw(fs::new_rsync_fallback_response(id, file_num, &e.to_string()), tx);
+                }
+            }
+        }
+        ipc::FS::RsyncChunkToWrite {
+            id,
+            file_num,
+            chunk_index,
+            compressed,
+            data,
+        } => {
+            let chunk = FileTransferRsyncChunk {
+                id,
+                file_num,
+                chunk_index,
+                is_delta: true,
+                compressed,
+                data,
+                ..Default::default()
+            };
+            let mut apply_params = None;
+            let mut err: Option<String> = None;
+            if let Some(job) = fs::get_job(id, write_jobs) {
+                match job.on_rsync_delta_chunk(&chunk) {
+                    Ok(p) => apply_params = p,
+                    Err(e) => err = Some(e.to_string()),
+                }
+            }
+            if let Some(params) = apply_params {
+                process_cm_rsync_apply(id, params, write_jobs, tx).await;
+            }
+            if let Some(e) = err {
+                log::warn!("job {}: rsync delta chunk error: {}", id, e);
+                if let Some(job) = fs::get_job(id, write_jobs) {
+                    job.rsync_fallback_local().await;
+                }
+                send_raw(fs::new_rsync_fallback_response(id, file_num, &e), tx);
+            }
+        }
+        ipc::FS::RsyncFallbackToWrite { id, file_num } => {
+            log::info!("job {}: client rsync fallback (write)", id);
+            if let Some(job) = fs::get_job(id, write_jobs) {
+                job.rsync_fallback_local().await;
+            }
         }
         // Cancel an ongoing read job (file transfer from server to client).
         // Note: This only cancels jobs in `read_jobs`. It does NOT cancel `ReadAllFiles`
@@ -1171,6 +1385,8 @@ async fn handle_fs(
         // have persistent job tracking.
         ipc::FS::CancelRead { id, conn_id: _ } => {
             if let Some(job) = fs::remove_job(id, read_jobs) {
+                // Also removes a stale rsync delta spool if any.
+                job.remove_download_file();
                 if let Some(tx) = tx_log {
                     if let Err(e) = tx.send(serialize_transfer_job(&job, false, true, "")) {
                         log::error!("error sending transfer job log via IPC: {}", e);
@@ -1217,6 +1433,200 @@ async fn handle_fs(
     }
 }
 
+/// After an overwrite confirm on a CM write job (upload direction: this side
+/// holds the old file), produce the signature or tell the peer to fall back.
+#[cfg(not(any(target_os = "ios")))]
+async fn process_cm_rsync_confirm_action(
+    id: i32,
+    write_jobs: &mut Vec<fs::TransferJob>,
+    tx: &UnboundedSender<Data>,
+) {
+    let (action, file_num, sig_path) = match fs::get_job(id, write_jobs) {
+        Some(job) => (
+            job.take_rsync_confirm_action(),
+            job.file_num(),
+            job.rsync_signature_path(),
+        ),
+        None => return,
+    };
+    match action {
+        fs::RsyncConfirmAction::Nothing => {}
+        fs::RsyncConfirmAction::SendFallback => {
+            log::info!("job {}: rsync declined (old file missing)", id);
+            send_raw(
+                fs::new_rsync_fallback_response(id, file_num, "old file missing"),
+                tx,
+            );
+        }
+        fs::RsyncConfirmAction::ComputeSignature => {
+            let Some(path) = sig_path else {
+                return;
+            };
+            let sig_result = spawn_blocking(move || fs::rsync::signature_from_file(&path))
+                .await
+                .unwrap_or_else(|e| Err(hbb_common::anyhow::anyhow!("{}", e)));
+            match sig_result {
+                Ok((sig, info)) => {
+                    log::info!(
+                        "job {}: rsync signature ready, {} bytes, {} chunks",
+                        id,
+                        info.sig_len,
+                        info.num_chunks
+                    );
+                    send_raw(
+                        fs::new_rsync_meta_response(FileTransferRsyncMeta {
+                            id,
+                            file_num,
+                            old_file_size: info.old_file_size,
+                            block_size: info.block_size,
+                            sig_len: info.sig_len,
+                            num_chunks: info.num_chunks,
+                            ..Default::default()
+                        }),
+                        tx,
+                    );
+                    for (i, (data, compressed)) in
+                        fs::rsync::signature_to_chunks(&sig).into_iter().enumerate()
+                    {
+                        send_raw(
+                            fs::new_rsync_chunk_response(FileTransferRsyncChunk {
+                                id,
+                                file_num,
+                                chunk_index: i as u32,
+                                is_delta: false,
+                                compressed,
+                                data: data.into(),
+                                ..Default::default()
+                            }),
+                            tx,
+                        );
+                    }
+                    if let Some(job) = fs::get_job(id, write_jobs) {
+                        job.rsync_signature_sent();
+                    }
+                }
+                Err(e) => {
+                    log::warn!("job {}: rsync signature failed: {}", id, e);
+                    send_raw(
+                        fs::new_rsync_fallback_response(id, file_num, &e.to_string()),
+                        tx,
+                    );
+                    if let Some(job) = fs::get_job(id, write_jobs) {
+                        job.rsync_fallback_local().await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Handle the diff result for a CM read job (download direction).
+#[cfg(not(any(target_os = "ios")))]
+async fn process_cm_rsync_diff(
+    id: i32,
+    file_num: i32,
+    diff: ResultType<fs::rsync::DeltaInfo>,
+    spool: &std::path::Path,
+    read_jobs: &mut Vec<fs::TransferJob>,
+    tx: &UnboundedSender<Data>,
+) {
+    let too_big = |info: &fs::rsync::DeltaInfo| {
+        info.delta_len >= std::cmp::min(info.new_file_size, fs::rsync::MAX_DELTA_BYTES)
+    };
+    let fallback = |read_jobs: &mut Vec<fs::TransferJob>, tx: &UnboundedSender<Data>, reason: &str| async move {
+        if let Some(job) = fs::get_job(id, read_jobs) {
+            job.rsync_fallback_local().await;
+        }
+        send_raw(fs::new_rsync_fallback_response(id, file_num, reason), tx);
+    };
+    match diff {
+        Ok(info) if too_big(&info) => {
+            let reason = format!(
+                "delta {} >= threshold (file {})",
+                info.delta_len, info.new_file_size
+            );
+            log::info!("job {}: rsync {}", id, reason);
+            fallback(read_jobs, tx, &reason).await;
+        }
+        Ok(info) => {
+            let started = fs::get_job(id, read_jobs)
+                .map(|job| job.begin_sending_delta(spool, info.clone()).is_ok())
+                .unwrap_or(false);
+            if started {
+                log::info!(
+                    "job {}: rsync delta ready, {} bytes vs file {} bytes",
+                    id,
+                    info.delta_len,
+                    info.new_file_size
+                );
+                send_raw(
+                    fs::new_rsync_delta_meta_response(FileTransferRsyncDeltaMeta {
+                        id,
+                        file_num,
+                        new_file_size: info.new_file_size,
+                        delta_len: info.delta_len,
+                        num_chunks: info.num_chunks,
+                        sha256: info.sha256_new.to_vec().into(),
+                        last_modified: info.last_modified,
+                        ..Default::default()
+                    }),
+                    tx,
+                );
+            } else {
+                fallback(read_jobs, tx, "failed to open delta spool").await;
+            }
+        }
+        Err(e) => {
+            log::warn!("job {}: rsync diff failed: {}", id, e);
+            fallback(read_jobs, tx, &e.to_string()).await;
+        }
+    }
+}
+
+/// Apply + verify a completed delta on a CM write job (upload direction).
+#[cfg(not(any(target_os = "ios")))]
+async fn process_cm_rsync_apply(
+    id: i32,
+    params: fs::RsyncApplyParams,
+    write_jobs: &mut Vec<fs::TransferJob>,
+    tx: &UnboundedSender<Data>,
+) {
+    let file_num = match fs::get_job(id, write_jobs) {
+        Some(job) => job.file_num(),
+        None => return,
+    };
+    let result = spawn_blocking(move || {
+        fs::rsync::apply_and_verify(
+            &params.old_file,
+            &params.delta,
+            &params.out_file,
+            params.new_file_size,
+            &params.sha256,
+        )
+    })
+    .await
+    .unwrap_or_else(|e| Err(hbb_common::anyhow::anyhow!("{}", e)));
+    match result {
+        Ok(()) => {
+            log::info!("job {}: rsync apply verified ok", id);
+            if let Some(job) = fs::get_job(id, write_jobs) {
+                job.rsync_finish();
+            }
+            send_raw(fs::new_rsync_ack_response(id, file_num), tx);
+        }
+        Err(e) => {
+            log::warn!("job {}: rsync apply failed: {}", id, e);
+            send_raw(
+                fs::new_rsync_fallback_response(id, file_num, &e.to_string()),
+                tx,
+            );
+            if let Some(job) = fs::get_job(id, write_jobs) {
+                job.rsync_fallback_local().await;
+            }
+        }
+    }
+}
+
 /// Start a read job in CM for file transfer from server to client (Windows only).
 ///
 /// This creates a `TransferJob` using `new_read()`, validates it, and sends the
@@ -1234,6 +1644,7 @@ async fn start_read_job(
     id: i32,
     conn_id: i32,
     overwrite_detection: bool,
+    enable_rsync: bool,
     read_jobs: &mut Vec<fs::TransferJob>,
     tx: &UnboundedSender<Data>,
 ) {
@@ -1255,6 +1666,7 @@ async fn start_read_job(
 
     match result {
         Ok(Ok(mut job)) => {
+            job.set_rsync_enabled(enable_rsync);
             // Optional: enforce file count limit for CM-side jobs to avoid
             // excessive I/O. This is applied on the job's file list produced
             // by `new_read`, similar to how AllFiles uses the same helper.
@@ -1366,8 +1778,8 @@ async fn handle_read_jobs_tick(
             continue;
         }
 
-        // Read a block from the file
-        match job.read().await {
+        // Read a block or rsync delta chunk from the file
+        match job.read_chunk().await {
             Err(err) => {
                 if let Err(e) = tx.send(Data::FileReadError {
                     id: job.id,
@@ -1382,7 +1794,7 @@ async fn handle_read_jobs_tick(
                 // after receiving FileReadError, so continuing would be pointless.
                 finished.push(job.id);
             }
-            Ok(Some(block)) => {
+            Ok(Some(fs::JobChunk::Block(block))) => {
                 if let Err(e) = tx.send(Data::FileBlockFromCM {
                     id: block.id,
                     file_num: block.file_num,
@@ -1391,6 +1803,19 @@ async fn handle_read_jobs_tick(
                     conn_id,
                 }) {
                     log::error!("error sending FileBlockFromCM via IPC: {}", e);
+                }
+            }
+            Ok(Some(fs::JobChunk::RsyncDelta(chunk))) => {
+                if let Err(e) = tx.send(Data::RsyncChunkFromCM {
+                    id: chunk.id,
+                    file_num: chunk.file_num,
+                    chunk_index: chunk.chunk_index,
+                    is_delta: chunk.is_delta,
+                    compressed: chunk.compressed,
+                    data: chunk.data,
+                    conn_id,
+                }) {
+                    log::error!("error sending RsyncChunkFromCM via IPC: {}", e);
                 }
             }
             Ok(None) => {

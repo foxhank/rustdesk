@@ -395,6 +395,13 @@ class FileController {
             sessionId: sessionId,
             name: isLocal ? "local_show_hidden" : "remote_show_hidden"))
         .isNotEmpty;
+    // Rsync incremental transfer is a single session-level option shared by
+    // both panes; default on, remembered per peer.
+    final savedRsync = await bind.sessionGetPeerOption(
+        sessionId: sessionId, name: "enable_rsync");
+    if (savedRsync.isNotEmpty) {
+      options.value.enableRsync = savedRsync == "Y";
+    }
     options.value.isWindows = isLocal
         ? isWindows
         : rootState.target?.ffiModel.pi.platform == kPeerPlatformWindows;
@@ -434,12 +441,22 @@ class FileController {
     msgMap[isLocal ? "local_dir" : "remote_dir"] = directory.value.path;
     msgMap[isLocal ? "local_show_hidden" : "remote_show_hidden"] =
         options.value.showHidden ? "Y" : "";
+    if (isLocal) {
+      // Persisted once by the local pane (single session-level option).
+      msgMap["enable_rsync"] = options.value.enableRsync ? "Y" : "";
+    }
     for (final msg in msgMap.entries) {
       await bind.sessionPeerOption(
           sessionId: sessionId, name: msg.key, value: msg.value);
     }
     directory.value.clear();
     options.value.clear();
+  }
+
+  void toggleEnableRsync({bool? enable}) {
+    options.update((opt) {
+      opt?.enableRsync = enable ?? !opt.enableRsync;
+    });
   }
 
   void toggleShowHidden({bool? showHidden}) {
@@ -580,6 +597,7 @@ class FileController {
     final toPath = otherSideData.directory.path;
     final isWindows = otherSideData.options.isWindows;
     final showHidden = otherSideData.options.showHidden;
+    final enableRsync = options.value.enableRsync;
     final transferJobs = <(Entry, int)>[];
     final transferJobIds = <int>[];
     for (var from in items.items) {
@@ -597,7 +615,8 @@ class FileController {
           fileNum: 0,
           includeHidden: showHidden,
           isRemote: isRemoteToLocal,
-          isDir: from.isDirectory);
+          isDir: from.isDirectory,
+          enableRsync: enableRsync);
       debugPrint(
           "path: ${from.path}, toPath: $toPath, to: ${PathUtil.join(toPath, from.name, isWindows)}");
     }
@@ -1227,6 +1246,7 @@ class JobController {
     String remote = jobDetail['remote'];
     String to = jobDetail['to'];
     bool showHidden = jobDetail['show_hidden'];
+    bool enableRsync = jobDetail['enable_rsync'] == true;
     int fileNum = jobDetail['file_num'];
     bool isRemote = jobDetail['is_remote'];
     bool isAutoStart = jobDetail['auto_start'] == true;
@@ -1276,6 +1296,7 @@ class JobController {
       path: isRemote ? remote : to,
       to: isRemote ? to : remote,
       fileNum: fileNum,
+      enableRsync: enableRsync,
     );
 
     if (isAutoStart) {
@@ -1801,14 +1822,19 @@ class DirectoryOptions {
   String home;
   bool showHidden;
   bool isWindows;
+  bool enableRsync;
 
   DirectoryOptions(
-      {this.home = "", this.showHidden = false, this.isWindows = false});
+      {this.home = "",
+      this.showHidden = false,
+      this.isWindows = false,
+      this.enableRsync = true});
 
   clear() {
     home = "";
     showHidden = false;
     isWindows = false;
+    enableRsync = true;
   }
 }
 

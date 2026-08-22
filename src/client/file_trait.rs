@@ -122,6 +122,7 @@ pub trait FileManager: Interface {
         file_num: i32,
         include_hidden: bool,
         is_remote: bool,
+        enable_rsync: bool,
     ) {
         self.send(Data::SendFiles((
             id,
@@ -131,6 +132,7 @@ pub trait FileManager: Interface {
             file_num,
             include_hidden,
             is_remote,
+            enable_rsync,
         )));
     }
 
@@ -143,6 +145,7 @@ pub trait FileManager: Interface {
         file_num: i32,
         include_hidden: bool,
         is_remote: bool,
+        enable_rsync: bool,
     ) {
         self.send(Data::AddJob((
             id,
@@ -152,6 +155,7 @@ pub trait FileManager: Interface {
             file_num,
             include_hidden,
             is_remote,
+            enable_rsync,
         )));
     }
 

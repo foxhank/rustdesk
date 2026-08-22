@@ -2788,6 +2788,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fast_rsync"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d97c4d6e20491c84c60612a24660fc1fbfc56bfe24f5b49e6a9fd3259010794"
+dependencies = [
+ "arrayref",
+]
+
+[[package]]
 name = "fastrand"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3780,6 +3789,7 @@ dependencies = [
  "dirs-next",
  "dlopen",
  "env_logger 0.11.6",
+ "fast_rsync",
  "filetime",
  "flexi_logger",
  "futures",
@@ -3791,6 +3801,7 @@ dependencies = [
  "log",
  "mac_address",
  "machine-uid",
+ "memmap2",
  "osascript",
  "protobuf",
  "protobuf-codegen",

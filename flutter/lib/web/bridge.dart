@@ -530,6 +530,7 @@ class RustdeskImpl {
       required bool includeHidden,
       required bool isRemote,
       required bool isDir,
+      required bool enableRsync,
       dynamic hint}) {
     return Future(() => js.context.callMethod('setByName', [
           'send_files',
@@ -541,6 +542,7 @@ class RustdeskImpl {
             'include_hidden': includeHidden,
             'is_remote': isRemote,
             'is_dir': isDir,
+            'enable_rsync': enableRsync,
           })
         ]));
   }
@@ -661,6 +663,7 @@ class RustdeskImpl {
       required int fileNum,
       required bool includeHidden,
       required bool isRemote,
+      required bool enableRsync,
       dynamic hint}) {
     throw UnimplementedError("sessionAddJob");
   }
