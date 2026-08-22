@@ -6078,7 +6078,7 @@ impl Connection {
         // This path is only used to identify the printer job.
         let path = format!("RustDesk://FsJob//Printer/{}", get_time());
 
-        let msg = fs::new_send(0, fs::JobType::Printer, path.clone(), 1, false);
+        let msg = fs::new_send(0, fs::JobType::Printer, path.clone(), 1, false, false);
         self.send(msg).await;
         self.printer_data
             .retain(|(t, _, _)| t.elapsed().as_secs() < 60);
