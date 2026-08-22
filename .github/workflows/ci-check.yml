@@ -12,6 +12,8 @@ jobs:
     runs-on: windows-latest
     env:
       VCPKG_DEFAULT_TRIPLET: x64-windows-static
+      VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
+      VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
@@ -30,15 +32,29 @@ jobs:
         with:
           version: "15.0.6"
 
-      - name: Setup vcpkg (opus only, classic mode)
+      - name: Setup vcpkg with GitHub Actions binary cache
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies (full manifest, like upstream builds)
         shell: bash
         run: |
-          git clone --depth 1 https://github.com/microsoft/vcpkg C:/vcpkg-ci
-          C:/vcpkg-ci/bootstrap-vcpkg.bat -disableMetrics
-          # Run from the vcpkg dir: the repo root has a vcpkg.json which would
-          # switch vcpkg to manifest mode (no individual package args allowed).
-          cd C:/vcpkg-ci && ./vcpkg.exe install opus:x64-windows-static
-          echo "VCPKG_ROOT=C:/vcpkg-ci" >> "$GITHUB_ENV"
+          if ! $VCPKG_ROOT/vcpkg \
+            install \
+            --triplet x64-windows-static \
+            --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+              echo "$_1:"
+              echo "======"
+              cat "$_1"
+              echo "======"
+              echo ""
+            done
+            exit 1
+          fi
 
       - name: cargo check (whole workspace)
         shell: bash
