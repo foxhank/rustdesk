@@ -1211,6 +1211,7 @@ impl<T: InvokeUiSession> Remote<T> {
                 _ => return,
             }
         };
+        let spool_for_reader = spool.clone();
         let diff_result = tokio::task::spawn_blocking(move || {
             fs::rsync::diff_to_spool(&new_file, &sig_bytes, &spool)
         })
@@ -1239,7 +1240,7 @@ impl<T: InvokeUiSession> Remote<T> {
             }
             Ok(info) => {
                 let started = fs::get_job(id, &mut self.read_jobs)
-                    .map(|job| job.begin_sending_delta(&spool, info.clone()).is_ok())
+                    .map(|job| job.begin_sending_delta(&spool_for_reader, info.clone()).is_ok())
                     .unwrap_or(false);
                 if started {
                     log::info!(

@@ -1284,10 +1284,11 @@ async fn handle_fs(
                     }
                 };
                 if let Some((new_file, spool)) = paths {
+                    let spool_for_later = spool.clone();
                     let diff = spawn_blocking(move || fs::rsync::diff_to_spool(&new_file, &sig, &spool))
                         .await
                         .unwrap_or_else(|e| Err(hbb_common::anyhow::anyhow!("{}", e)));
-                    process_cm_rsync_diff(id, file_num, diff, &spool, read_jobs, tx).await;
+                    process_cm_rsync_diff(id, file_num, diff, &spool_for_later, read_jobs, tx).await;
                 }
             }
         }

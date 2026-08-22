@@ -3581,6 +3581,7 @@ impl Connection {
                                             },
                                         );
                                         if let Some((new_file, spool, file_num)) = paths {
+                                            let spool_for_later = spool.clone();
                                             let diff = tokio::task::spawn_blocking(move || {
                                                 fs::rsync::diff_to_spool(&new_file, &sig, &spool)
                                             })
@@ -3592,7 +3593,7 @@ impl Connection {
                                                 c.id,
                                                 file_num,
                                                 diff,
-                                                &spool,
+                                                &spool_for_later,
                                             )
                                             .await;
                                         }
