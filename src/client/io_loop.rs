@@ -1220,12 +1220,6 @@ impl<T: InvokeUiSession> Remote<T> {
         let too_big = |info: &fs::rsync::DeltaInfo| {
             info.delta_len >= std::cmp::min(info.new_file_size, fs::rsync::MAX_DELTA_BYTES)
         };
-        let fallback = |this: &mut Self, reason: String| async move {
-            log::warn!("job {}: rsync diff fallback: {}", id, reason);
-            if let Some(job) = fs::get_job(id, &mut this.read_jobs) {
-                job.rsync_fallback_local().await;
-            }
-        };
         match diff_result {
             Ok(info) if too_big(&info) => {
                 let reason = format!(
@@ -1236,7 +1230,7 @@ impl<T: InvokeUiSession> Remote<T> {
                     peer.send(&fs::new_rsync_fallback_action(id, file_num, &reason))
                         .await
                 );
-                fallback(self, reason).await;
+                self.rsync_diff_fallback(id, &reason).await;
             }
             Ok(info) => {
                 let started = fs::get_job(id, &mut self.read_jobs)
@@ -1270,7 +1264,7 @@ impl<T: InvokeUiSession> Remote<T> {
                         peer.send(&fs::new_rsync_fallback_action(id, file_num, &reason))
                             .await
                     );
-                    fallback(self, reason).await;
+                    self.rsync_diff_fallback(id, &reason).await;
                 }
             }
             Err(e) => {
@@ -1278,8 +1272,17 @@ impl<T: InvokeUiSession> Remote<T> {
                     peer.send(&fs::new_rsync_fallback_action(id, file_num, &e.to_string()))
                         .await
                 );
-                fallback(self, e.to_string()).await;
+                self.rsync_diff_fallback(id, &e.to_string()).await;
             }
+        }
+    }
+
+    /// Shared fallback path for `handle_rsync_diff`: reset the read job to
+    /// legacy transfer (the fallback message itself is sent by the caller).
+    async fn rsync_diff_fallback(&mut self, id: i32, reason: &str) {
+        log::warn!("job {}: rsync diff fallback: {}", id, reason);
+        if let Some(job) = fs::get_job(id, &mut self.read_jobs) {
+            job.rsync_fallback_local().await;
         }
     }
 

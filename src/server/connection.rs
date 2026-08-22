@@ -5427,13 +5427,6 @@ impl Connection {
         let too_big = |info: &fs::rsync::DeltaInfo| {
             info.delta_len >= std::cmp::min(info.new_file_size, fs::rsync::MAX_DELTA_BYTES)
         };
-        let fallback = |this: &mut Self, reason: String| async move {
-            if let Some(job) = fs::get_job(id, &mut this.read_jobs) {
-                job.rsync_fallback_local().await;
-            }
-            this.send(fs::new_rsync_fallback_response(id, file_num, &reason))
-                .await;
-        };
         match diff {
             Ok(info) if too_big(&info) => {
                 let reason = format!(
@@ -5441,7 +5434,7 @@ impl Connection {
                     info.delta_len, info.new_file_size
                 );
                 log::info!("job {}: rsync {}", id, reason);
-                fallback(self, reason).await;
+                self.local_rsync_diff_fallback(id, file_num, &reason).await;
             }
             Ok(info) => {
                 let started = fs::get_job(id, &mut self.read_jobs)
@@ -5468,14 +5461,26 @@ impl Connection {
                     ))
                     .await;
                 } else {
-                    fallback(self, "failed to open delta spool".to_string()).await;
+                    self.local_rsync_diff_fallback(id, file_num, "failed to open delta spool")
+                        .await;
                 }
             }
             Err(e) => {
                 log::warn!("job {}: rsync diff failed: {}", id, e);
-                fallback(self, e.to_string()).await;
+                self.local_rsync_diff_fallback(id, file_num, &e.to_string())
+                    .await;
             }
         }
+    }
+
+    /// Shared fallback path for `handle_local_rsync_diff`: reset the local
+    /// read job to legacy transfer and tell the client.
+    async fn local_rsync_diff_fallback(&mut self, id: i32, file_num: i32, reason: &str) {
+        if let Some(job) = fs::get_job(id, &mut self.read_jobs) {
+            job.rsync_fallback_local().await;
+        }
+        self.send(fs::new_rsync_fallback_response(id, file_num, reason))
+            .await;
     }
 
     #[inline]

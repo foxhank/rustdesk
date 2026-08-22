@@ -1294,7 +1294,7 @@ async fn handle_fs(
         }
         ipc::FS::RsyncFallbackToRead {
             id,
-            file_num,
+            file_num: _,
             conn_id: _,
         } => {
             log::info!("job {}: client rsync fallback (read)", id);
@@ -1374,7 +1374,7 @@ async fn handle_fs(
                 send_raw(fs::new_rsync_fallback_response(id, file_num, &e), tx);
             }
         }
-        ipc::FS::RsyncFallbackToWrite { id, file_num } => {
+        ipc::FS::RsyncFallbackToWrite { id, file_num: _ } => {
             log::info!("job {}: client rsync fallback (write)", id);
             if let Some(job) = fs::get_job(id, write_jobs) {
                 job.rsync_fallback_local().await;
@@ -1534,12 +1534,6 @@ async fn process_cm_rsync_diff(
     let too_big = |info: &fs::rsync::DeltaInfo| {
         info.delta_len >= std::cmp::min(info.new_file_size, fs::rsync::MAX_DELTA_BYTES)
     };
-    let fallback = |read_jobs: &mut Vec<fs::TransferJob>, tx: &UnboundedSender<Data>, reason: &str| async move {
-        if let Some(job) = fs::get_job(id, read_jobs) {
-            job.rsync_fallback_local().await;
-        }
-        send_raw(fs::new_rsync_fallback_response(id, file_num, reason), tx);
-    };
     match diff {
         Ok(info) if too_big(&info) => {
             let reason = format!(
@@ -1547,7 +1541,7 @@ async fn process_cm_rsync_diff(
                 info.delta_len, info.new_file_size
             );
             log::info!("job {}: rsync {}", id, reason);
-            fallback(read_jobs, tx, &reason).await;
+            cm_rsync_diff_fallback(id, file_num, &reason, read_jobs, tx).await;
         }
         Ok(info) => {
             let started = fs::get_job(id, read_jobs)
@@ -1574,14 +1568,31 @@ async fn process_cm_rsync_diff(
                     tx,
                 );
             } else {
-                fallback(read_jobs, tx, "failed to open delta spool").await;
+                cm_rsync_diff_fallback(id, file_num, "failed to open delta spool", read_jobs, tx)
+                    .await;
             }
         }
         Err(e) => {
             log::warn!("job {}: rsync diff failed: {}", id, e);
-            fallback(read_jobs, tx, &e.to_string()).await;
+            cm_rsync_diff_fallback(id, file_num, &e.to_string(), read_jobs, tx).await;
         }
     }
+}
+
+/// Shared fallback path for `process_cm_rsync_diff`: reset the CM read job
+/// to legacy transfer and tell the client.
+#[cfg(not(any(target_os = "ios")))]
+async fn cm_rsync_diff_fallback(
+    id: i32,
+    file_num: i32,
+    reason: &str,
+    read_jobs: &mut Vec<fs::TransferJob>,
+    tx: &UnboundedSender<Data>,
+) {
+    if let Some(job) = fs::get_job(id, read_jobs) {
+        job.rsync_fallback_local().await;
+    }
+    send_raw(fs::new_rsync_fallback_response(id, file_num, reason), tx);
 }
 
 /// Apply + verify a completed delta on a CM write job (upload direction).
