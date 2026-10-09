@@ -133,9 +133,7 @@ pub fn global_init() -> bool {
     hbb_common::config::DEFAULT_SETTINGS
         .write()
         .unwrap()
-        .entry(
-            hbb_common::config::keys::OPTION_ALLOW_REMOTE_CONFIG_MODIFICATION.to_owned(),
-        )
+        .entry(keys::OPTION_ALLOW_REMOTE_CONFIG_MODIFICATION.to_owned())
         .or_insert("Y".to_owned());
     true
 }
