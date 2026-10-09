@@ -62,8 +62,7 @@ jobs:
         shell: bash
         run: cargo check 2>&1 | tail -100
 
-      - name: cargo test hbb_common (newer toolchain: hbb_common's webrtc
-          dev-dependency needs Rust >= 1.87)
+      - name: cargo test hbb_common (toolchain 1.87 for webrtc dev-dep)
         shell: bash
         run: |
           rustup toolchain install 1.87.0 --profile minimal
