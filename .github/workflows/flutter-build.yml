@@ -1961,6 +1961,18 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Apply custom server config
+        shell: bash
+        env:
+          RENDEZVOUS_SERVER: ${{ secrets.RENDEZVOUS_SERVER }}
+          RS_PUB_KEY: ${{ secrets.RS_PUB_KEY }}
+        run: |
+          SERVER="${RENDEZVOUS_SERVER:-rs-ny.rustdesk.com}"
+          KEY="${RS_PUB_KEY:-OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=}"
+          sed -i.bak "s/rs-ny.rustdesk.com/${SERVER}/g" libs/hbb_common/src/config.rs
+          sed -i.bak "s|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${KEY}|g" libs/hbb_common/src/config.rs
+          rm -f libs/hbb_common/src/config.rs.bak
+
       - name: Set Swap Space
         uses: pierotofy/set-swap-space@49819abfb41bd9b44fb781159c033dba90353a7c # v1.0
         with:
