@@ -175,7 +175,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     // `on_voice_call_closed` should be called when the connection is ended.
     // The inner logic of `on_voice_call_closed` will check if the voice call is active.
     // Only one client is considered here for now.
-    gFFI.chatModel.onVoiceCallClosed("End connetion");
+    gFFI.chatModel.onVoiceCallClosed("End connection");
   }
 
   @override
@@ -335,6 +335,10 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       // clipboard
       oldValue = '';
     }
+    // This length-only diff assumes the IME appends at the end. If an IME
+    // leaves the caret inside paired punctuation, later insertions can replay
+    // the closing symbol: "()" -> "(a)" sends ")" instead of "a". This is a
+    // client text-diff issue, independent of the host keyboard layout.
     if (newValue.length == oldValue.length) {
       // ?
     } else if (newValue.length < oldValue.length) {
@@ -1276,6 +1280,14 @@ void showOptions(
   List<TToggleMenu> cursorToggles = await toolbarCursor(context, id, gFFI);
   List<TToggleMenu> displayToggles =
       await toolbarDisplayToggle(context, id, gFFI);
+  if (isMobile) {
+    displayToggles.insert(
+        0,
+        TToggleMenu(
+            child: Text(translate('Lock canvas')),
+            value: gFFI.canvasModel.locked,
+            onChanged: (value) => gFFI.canvasModel.setLocked(value == true)));
+  }
 
   List<TToggleMenu> privacyModeList = [];
   if ((gFFI.ffiModel.pi.features.privacyMode && gFFI.ffiModel.keyboard) ||
