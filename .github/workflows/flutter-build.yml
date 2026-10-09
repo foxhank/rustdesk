@@ -1380,7 +1380,9 @@ jobs:
   build-rustdesk-android-universal:
     needs: [build-rustdesk-android]
     name: build rustdesk android universal apk
-    if: ${{ inputs.upload-artifact }}
+    # Aggregates the x86_64-android lib too, but that matrix job is
+    # commented out in this fork, so the artifact download always fails.
+    if: false
     runs-on: ubuntu-24.04
     env:
       reltype: release
