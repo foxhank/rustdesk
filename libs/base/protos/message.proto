@@ -414,6 +414,11 @@ message FileAction {
     FileTransferSendConfirmRequest send_confirm = 9;
     FileRename rename = 10;
     ReadEmptyDirs read_empty_dirs = 11;
+    FileTransferRsyncMeta rsync_meta = 12;
+    FileTransferRsyncDeltaMeta rsync_delta_meta = 13;
+    FileTransferRsyncChunk rsync_chunk = 14;
+    FileTransferRsyncFallback rsync_fallback = 15;
+    FileTransferRsyncAck rsync_ack = 16;
   }
 }
 
@@ -427,6 +432,11 @@ message FileResponse {
     FileTransferDone done = 4;
     FileTransferDigest digest = 5;
     ReadEmptyDirsResponse empty_dirs = 6;
+    FileTransferRsyncMeta rsync_meta = 7;
+    FileTransferRsyncDeltaMeta rsync_delta_meta = 8;
+    FileTransferRsyncChunk rsync_chunk = 9;
+    FileTransferRsyncFallback rsync_fallback = 10;
+    FileTransferRsyncAck rsync_ack = 11;
   }
 }
 
@@ -469,6 +479,9 @@ message FileTransferSendRequest {
     Printer = 1;
   }
   FileType file_type = 5;
+  // Ask the peer for rsync-style incremental transfer. Old peers ignore
+  // this field and the sender falls back to legacy whole-file transfer.
+  bool enable_rsync = 6;
 }
 
 message FileTransferSendConfirmRequest {
@@ -491,6 +504,58 @@ message FileTransferReceiveRequest {
   repeated FileEntry files = 3;
   int32 file_num = 4;
   uint64 total_size = 5;
+  // Ask the peer for rsync-style incremental transfer. Old peers ignore
+  // this field and the sender falls back to legacy whole-file transfer.
+  bool enable_rsync = 6;
+}
+
+// Rsync incremental transfer messages.
+//
+// Flow (after the existing digest -> confirm(overwrite) handshake):
+//  1. old-file side: RsyncMeta + num_chunks * RsyncChunk(is_delta=false)
+//     carrying the serialized fast_rsync signature of the old file.
+//  2. new-file side: RsyncDeltaMeta + num_chunks * RsyncChunk(is_delta=true)
+//     carrying the delta; delta_meta.sha256 is the SHA-256 of the whole new
+//     file (integrity backstop verified after apply).
+//  3. old-file side: RsyncAck after apply+verify succeeded, or
+//     RsyncFallback to revert this file to legacy full transfer.
+message FileTransferRsyncMeta {
+  int32 id = 1;
+  sint32 file_num = 2;
+  uint64 old_file_size = 3; // size of the base file the signature covers
+  uint32 block_size = 4;    // fast_rsync block size used
+  uint64 sig_len = 5;       // total serialized signature length
+  uint32 num_chunks = 6;
+}
+
+message FileTransferRsyncDeltaMeta {
+  int32 id = 1;
+  sint32 file_num = 2;
+  uint64 new_file_size = 3; // also the output limit for apply
+  uint64 delta_len = 4;     // total delta length
+  uint32 num_chunks = 5;
+  bytes sha256 = 6;         // SHA-256 of the entire new file (32 bytes)
+  uint64 last_modified = 7; // mtime to restore after finalize
+}
+
+message FileTransferRsyncChunk {
+  int32 id = 1;
+  sint32 file_num = 2;
+  uint32 chunk_index = 3; // 0-based, strictly increasing
+  bool is_delta = 4;      // false: signature chunk, true: delta chunk
+  bool compressed = 5;    // per-chunk zstd, like FileTransferBlock
+  bytes data = 6;
+}
+
+message FileTransferRsyncFallback {
+  int32 id = 1;
+  sint32 file_num = 2;
+  string reason = 3; // diagnostics only
+}
+
+message FileTransferRsyncAck {
+  int32 id = 1;
+  sint32 file_num = 2;
 }
 
 message FileRemoveDir {

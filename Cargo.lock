@@ -655,21 +655,25 @@ dependencies = [
  "anyhow",
  "backtrace",
  "bytes",
+ "fast_rsync",
  "filetime",
  "hbb_common",
  "lazy_static",
  "libc",
  "log",
+ "memmap2",
  "osascript",
  "protobuf",
  "protobuf-codegen",
  "serde 1.0.228",
  "serde_derive",
  "serde_json 1.0.118",
+ "sha2",
  "smithay-client-toolkit 0.20.0",
  "tokio",
  "users",
  "winapi 0.3.9",
+ "zstd",
 ]
 
 [[package]]
@@ -2306,7 +2310,7 @@ version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330c60081dcc4c72131f8eb70510f1ac07223e5d4163db481a04a0befcffa412"
 dependencies = [
- "libloading 0.7.4",
+ "libloading 0.8.4",
 ]
 
 [[package]]
@@ -2707,6 +2711,15 @@ dependencies = [
  "rayon-core",
  "smallvec",
  "zune-inflate",
+]
+
+[[package]]
+name = "fast_rsync"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d97c4d6e20491c84c60612a24660fc1fbfc56bfe24f5b49e6a9fd3259010794"
+dependencies = [
+ "arrayref",
 ]
 
 [[package]]
@@ -4417,7 +4430,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e310b3a6b5907f99202fcdb4960ff45b93735d7c7d96b760fcff8db2dc0e103d"
 dependencies = [
  "cfg-if 1.0.0",
- "windows-targets 0.48.5",
+ "windows-targets 0.52.6",
 ]
 
 [[package]]

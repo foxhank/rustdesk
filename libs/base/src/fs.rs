@@ -25,6 +25,8 @@ use hbb_common::{
     get_version_number, ResultType, Stream,
 };
 
+pub use crate::rsync;
+
 static NEXT_JOB_ID: AtomicI32 = AtomicI32::new(1);
 
 pub fn get_next_job_id() -> i32 {
@@ -388,6 +390,96 @@ pub struct FileDigest {
     pub modified: u64,
 }
 
+/// State machine for rsync-style incremental transfer of the current file.
+/// Both sides start in `Off` and only enter the protocol after an explicit
+/// overwrite confirm (`offset_blk == 0`) when eligibility holds.
+///
+/// Reader = the side that has the NEW file and streams data (read job).
+/// Writer = the side that has the OLD file and receives data (write job).
+#[derive(Debug)]
+pub enum RsyncState {
+    Off,
+    // ---- reader (new-file side) ----
+    /// Confirmed overwrite; waiting for RsyncMeta from the writer.
+    AwaitSignature { since: std::time::Instant },
+    /// Receiving signature chunks.
+    WaitingSigChunks { assembler: rsync::ChunkAssembler },
+    /// Signature complete; the caller is running the blocking diff.
+    Diffing,
+    /// Streaming delta chunks from the spool (one per pump tick).
+    SendingDelta {
+        reader: rsync::SpoolReader,
+        next_chunk: u32,
+        num_chunks: u32,
+        file_size: u64,
+    },
+    /// Last delta chunk sent; waiting for the writer's per-file ack before
+    /// advancing (an apply failure must be able to revert this file to
+    /// legacy transfer).
+    AwaitApply { since: std::time::Instant },
+    // ---- writer (old-file side) ----
+    /// Confirmed overwrite; the caller should compute and send the signature.
+    PrepareSignature,
+    /// Signature sent; waiting for RsyncDeltaMeta.
+    AwaitDelta,
+    /// Receiving delta chunks (accumulated in memory, bounded by
+    /// `rsync::MAX_DELTA_BYTES`).
+    ReceivingDelta {
+        assembler: rsync::ChunkAssembler,
+        next_index: u32,
+    },
+    /// Delta complete; the caller should run apply + verify.
+    DeltaReady {
+        delta: Vec<u8>,
+        new_file_size: u64,
+        sha256: [u8; 32],
+        last_modified: u64,
+    },
+}
+
+impl Default for RsyncState {
+    fn default() -> Self {
+        Self::Off
+    }
+}
+
+impl RsyncState {
+    #[inline]
+    pub fn is_off(&self) -> bool {
+        matches!(self, Self::Off)
+    }
+}
+
+/// One pump-tick unit of a read job's output.
+#[derive(Debug)]
+pub enum JobChunk {
+    Block(FileTransferBlock),
+    RsyncDelta(FileTransferRsyncChunk),
+}
+
+/// What the caller of `TransferJob::confirm` must do right after an
+/// overwrite confirm, for the writer (old-file) side.
+#[derive(Debug, PartialEq)]
+pub enum RsyncConfirmAction {
+    Nothing,
+    /// Compute the signature of the old file (`rsync_signature_path`) and
+    /// send RsyncMeta + chunks, then call `rsync_signature_sent`.
+    ComputeSignature,
+    /// The reader may be waiting for a signature that cannot be produced;
+    /// send FileTransferRsyncFallback so it resumes legacy transfer now.
+    SendFallback,
+}
+
+/// Parameters for the blocking apply + verify of a completed delta.
+#[derive(Debug)]
+pub struct RsyncApplyParams {
+    pub old_file: std::path::PathBuf,
+    pub delta: Vec<u8>,
+    pub out_file: std::path::PathBuf,
+    pub new_file_size: u64,
+    pub sha256: [u8; 32],
+}
+
 #[derive(Default, Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferJob {
@@ -417,6 +509,33 @@ pub struct TransferJob {
     default_overwrite_strategy: Option<bool>,
     #[serde(skip_serializing)]
     digest: FileDigest,
+
+    // ---- rsync incremental transfer support ----
+    /// Whether rsync incremental transfer was requested for this job.
+    rsync_enabled: bool,
+    #[serde(skip_serializing)]
+    rsync: RsyncState,
+    /// Amount of `finished_size` booked for rsync progress of the current
+    /// file; subtracted on fallback so progress never goes past 100%.
+    #[serde(skip_serializing)]
+    rsync_counted: u64,
+    /// Set when the current file was finalized by rsync (rename done);
+    /// consumed by the next `modify_time` call to avoid double-finalizing.
+    #[serde(skip_serializing)]
+    rsync_finalized: bool,
+    /// True for read jobs (this side streams the new file), false for write
+    /// jobs (this side holds the old file). Note `is_remote` means something
+    /// different (which machine the job's path lives on).
+    #[serde(skip_serializing)]
+    is_reader: bool,
+    /// Writer side: old file missing after overwrite confirm — the caller
+    /// must send RsyncFallback (the reader is waiting for a signature).
+    #[serde(skip_serializing)]
+    rsync_old_file_missing: bool,
+    /// Writer side: (new_file_size, sha256_new, last_modified) from
+    /// RsyncDeltaMeta, kept until the delta is complete.
+    #[serde(skip_serializing)]
+    rsync_delta_meta: Option<(u64, [u8; 32], u64)>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -433,6 +552,8 @@ pub struct TransferJobMeta {
     pub file_num: i32,
     #[serde(default)]
     pub is_remote: bool,
+    #[serde(default)]
+    pub enable_rsync: bool,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -627,6 +748,7 @@ impl TransferJob {
             files,
             total_size,
             enable_overwrite_detection,
+            is_reader: true,
             ..Default::default()
         })
     }
@@ -708,6 +830,12 @@ impl TransferJob {
         if self.r#type == JobType::Printer {
             return;
         }
+        if self.rsync_finalized {
+            // rsync_finish already renamed the verified output, restored the
+            // mtime and cleaned up temps; nothing to do for this file.
+            // (The flag is reset by the caller when moving to the next file.)
+            return;
+        }
         if let DataSource::FilePath(p) = &self.data_source {
             let file_num = self.file_num as usize;
             if file_num < self.files.len() {
@@ -743,6 +871,7 @@ impl TransferJob {
                 let digest_path = format!("{}.digest", get_string(&path));
                 std::fs::remove_file(download_path).ok();
                 std::fs::remove_file(digest_path).ok();
+                rsync::cleanup_rsync_temps(&path);
             }
         }
     }
@@ -764,6 +893,12 @@ impl TransferJob {
         if block.id != self.id {
             bail!("Wrong id");
         }
+        if !self.rsync.is_off() {
+            // Legacy blocks arriving during an rsync attempt mean the peer
+            // fell back (old peer, or its own fallback decision). Reset and
+            // let the normal block path recreate `<file>.download`.
+            self.rsync_fallback_local().await;
+        }
         match &self.data_source {
             DataSource::FilePath(p) => {
                 let file_num = block.file_num as usize;
@@ -772,6 +907,7 @@ impl TransferJob {
                 }
                 if file_num != self.file_num as usize || self.data_stream.is_none() {
                     self.modify_time();
+                    self.rsync_finalized = false;
                     if let Some(DataStream::FileStream(file)) = self.data_stream.as_mut() {
                         file.sync_all().await?;
                     }
@@ -1010,6 +1146,100 @@ impl TransferJob {
         }))
     }
 
+    /// One unit of output per pump tick: a legacy file block or an rsync
+    /// delta chunk. `None` means "nothing to send right now" (waiting for
+    /// confirmation / signature / apply ack, or job done) — same semantics
+    /// as `read()`.
+    pub async fn read_chunk(&mut self) -> ResultType<Option<JobChunk>> {
+        // Timeout-driven local fallbacks first (old peers never answer).
+        let timed_out = match &self.rsync {
+            RsyncState::AwaitSignature { since }
+                if since.elapsed() > rsync::SIGNATURE_WAIT_TIMEOUT =>
+            {
+                true
+            }
+            RsyncState::AwaitApply { since }
+                if since.elapsed() > rsync::APPLY_WAIT_TIMEOUT =>
+            {
+                true
+            }
+            _ => false,
+        };
+        if timed_out {
+            self.rsync_fallback_local().await;
+        }
+        if let RsyncState::SendingDelta { .. } = &self.rsync {
+            return self
+                .rsync_next_delta_chunk()
+                .await
+                .map(|o| o.map(JobChunk::RsyncDelta));
+        }
+        if !self.rsync.is_off() {
+            // Waiting for signature chunks / diff result / apply ack.
+            return Ok(None);
+        }
+        self.read().await.map(|o| o.map(JobChunk::Block))
+    }
+
+    /// Emit at most one delta chunk from the spool; on exhaustion enter
+    /// `AwaitApply` (the writer must ack before this file is advanced).
+    async fn rsync_next_delta_chunk(&mut self) -> ResultType<Option<FileTransferRsyncChunk>> {
+        let file_num = self.file_num;
+        let chunk = {
+            let RsyncState::SendingDelta {
+                reader,
+                next_chunk,
+                num_chunks,
+                file_size,
+            } = &mut self.rsync
+            else {
+                unreachable!()
+            };
+            match reader.next_chunk()? {
+                None => None,
+                Some((data, compressed)) => {
+                    let wire_len = data.len();
+                    let chunk = FileTransferRsyncChunk {
+                        id: self.id,
+                        file_num,
+                        chunk_index: *next_chunk,
+                        is_delta: true,
+                        compressed,
+                        data: data.into(),
+                        ..Default::default()
+                    };
+                    // Progress bookkeeping: honest wire bytes for speed,
+                    // proportional file-size progress for the UI bar.
+                    self.transferred += wire_len as u64;
+                    let per_chunk = if *num_chunks > 0 {
+                        *file_size / *num_chunks as u64
+                    } else {
+                        0
+                    };
+                    self.finished_size += per_chunk;
+                    self.rsync_counted += per_chunk;
+                    *next_chunk += 1;
+                    Some(chunk)
+                }
+            }
+        };
+        match chunk {
+            Some(c) => Ok(Some(c)),
+            None => {
+                // Snap progress to the exact file size and wait for the ack.
+                if let RsyncState::SendingDelta { file_size, .. } = &self.rsync {
+                    let file_size = *file_size;
+                    self.finished_size += file_size.saturating_sub(self.rsync_counted);
+                    self.rsync_counted = file_size;
+                }
+                self.rsync = RsyncState::AwaitApply {
+                    since: std::time::Instant::now(),
+                };
+                Ok(None)
+            }
+        }
+    }
+
     // Only for generic job and file stream
     async fn send_current_digest(&mut self, stream: &mut Stream) -> ResultType<()> {
         let (last_modified, file_size) = self.get_current_digest().await?;
@@ -1182,6 +1412,11 @@ impl TransferJob {
                     if offset > 0 {
                         self.set_stream_offset(r.file_num as usize, offset as u64)
                             .await;
+                    } else {
+                        // A plain overwrite confirm: consider rsync mode for
+                        // this file. Skip (above) and resume (offset > 0)
+                        // never enter rsync.
+                        self.rsync_on_overwrite_confirm();
                     }
                 }
                 _ => {}
@@ -1199,6 +1434,360 @@ impl TransferJob {
             file_num: self.file_num,
             show_hidden: self.show_hidden,
             is_remote: self.is_remote,
+            enable_rsync: self.rsync_enabled,
+        }
+    }
+
+    // ===================== rsync incremental transfer =====================
+
+    /// Enable/disable rsync incremental transfer for this job. Must be set
+    /// before the job starts. Requires overwrite detection to be enabled as
+    /// well (checked in `rsync_mode_possible`).
+    pub fn set_rsync_enabled(&mut self, on: bool) {
+        self.rsync_enabled = on;
+    }
+
+    #[inline]
+    pub fn rsync_enabled(&self) -> bool {
+        self.rsync_enabled
+    }
+
+    /// Current rsync state (for callers and tests).
+    #[inline]
+    pub fn rsync_state(&self) -> &RsyncState {
+        &self.rsync
+    }
+
+    fn rsync_mode_possible(&self) -> bool {
+        self.rsync_enabled
+            && self.r#type == JobType::Generic
+            && self.enable_overwrite_detection
+            && matches!(self.data_source, DataSource::FilePath(_))
+    }
+
+    /// Absolute path of the file currently being transferred, if any.
+    fn current_file_path(&self) -> Option<std::path::PathBuf> {
+        if let DataSource::FilePath(p) = &self.data_source {
+            let file_num = self.file_num as usize;
+            if file_num < self.files.len() {
+                let entry = &self.files[file_num];
+                return self.resolve_entry_path(p, &entry.name);
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn current_entry_size(&self) -> u64 {
+        self.files
+            .get(self.file_num as usize)
+            .map(|f| f.size)
+            .unwrap_or(0)
+    }
+
+    /// Hook called from `confirm()` on a plain overwrite confirm
+    /// (`offset_blk == 0`). Both sides evaluate eligibility independently
+    /// and reach the same size conclusion, so the writer only needs to send
+    /// an explicit fallback when the old file itself is missing.
+    fn rsync_on_overwrite_confirm(&mut self) {
+        self.rsync = RsyncState::Off;
+        if !self.rsync_mode_possible() {
+            return;
+        }
+        let new_size_ok = if self.is_reader {
+            self.current_entry_size() >= rsync::MIN_RSYNC_SIZE
+        } else {
+            self.digest.size >= rsync::MIN_RSYNC_SIZE
+        };
+        if !new_size_ok {
+            // The peer reaches the same conclusion silently; legacy flows.
+            return;
+        }
+        if self.is_reader {
+            log::info!(
+                "job {}: rsync enabled for file {} (await signature)",
+                self.id,
+                self.file_num
+            );
+            self.rsync = RsyncState::AwaitSignature {
+                since: std::time::Instant::now(),
+            };
+        } else if self
+            .current_file_path()
+            .map(|p| p.is_file())
+            .unwrap_or(false)
+        {
+            log::info!(
+                "job {}: rsync enabled for file {} (prepare signature)",
+                self.id,
+                self.file_num
+            );
+            self.rsync = RsyncState::PrepareSignature;
+        } else {
+            // Old file missing: the reader is waiting in AwaitSignature and
+            // must be told to fall back now instead of timing out.
+            self.rsync = RsyncState::PrepareSignature;
+            self.rsync_old_file_missing = true;
+        }
+    }
+
+    /// Writer-side action required after `confirm()`.
+    pub fn take_rsync_confirm_action(&mut self) -> RsyncConfirmAction {
+        if !matches!(self.rsync, RsyncState::PrepareSignature) {
+            return RsyncConfirmAction::Nothing;
+        }
+        if self.rsync_old_file_missing {
+            self.rsync_old_file_missing = false;
+            self.rsync = RsyncState::Off;
+            return RsyncConfirmAction::SendFallback;
+        }
+        RsyncConfirmAction::ComputeSignature
+    }
+
+    /// Path of the old file whose signature should be computed (writer side,
+    /// `PrepareSignature` state).
+    pub fn rsync_signature_path(&self) -> Option<std::path::PathBuf> {
+        if matches!(self.rsync, RsyncState::PrepareSignature) {
+            self.current_file_path()
+        } else {
+            None
+        }
+    }
+
+    /// Called after the caller finished sending RsyncMeta + signature chunks.
+    pub fn rsync_signature_sent(&mut self) {
+        if matches!(self.rsync, RsyncState::PrepareSignature) {
+            self.rsync = RsyncState::AwaitDelta;
+        }
+    }
+
+    // ---- reader (new-file side) message intake ----
+
+    pub fn on_rsync_meta(&mut self, meta: &FileTransferRsyncMeta) {
+        if !matches!(self.rsync, RsyncState::AwaitSignature { .. }) {
+            log::warn!("job {}: unexpected rsync meta in {:?}", self.id, self.rsync);
+            return;
+        }
+        let mut assembler = rsync::ChunkAssembler::new();
+        assembler.set_expected(meta.sig_len, meta.num_chunks);
+        self.rsync = RsyncState::WaitingSigChunks { assembler };
+    }
+
+    /// Feed one signature chunk. Returns the assembled signature bytes when
+    /// the stream is complete (the job then enters `Diffing`).
+    pub fn on_rsync_sig_chunk(&mut self, chunk: &FileTransferRsyncChunk) -> ResultType<Option<Vec<u8>>> {
+        let complete = match &mut self.rsync {
+            RsyncState::WaitingSigChunks { assembler } => {
+                assembler.feed(chunk.chunk_index, chunk.compressed, &chunk.data)?
+            }
+            _ => {
+                // Stale chunk (e.g. after fallback); ignore.
+                return Ok(None);
+            }
+        };
+        if complete {
+            if let RsyncState::WaitingSigChunks { assembler } = std::mem::take(&mut self.rsync) {
+                let bytes = assembler.finish();
+                self.rsync = RsyncState::Diffing;
+                return Ok(Some(bytes));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Spool path for the delta of the current file (reader side). The
+    /// caller runs the blocking diff into this path.
+    pub fn rsync_delta_spool_path(&self) -> Option<std::path::PathBuf> {
+        self.current_file_path().map(|p| rsync::delta_spool_path(&p))
+    }
+
+    /// New-file path for the diff (reader side).
+    pub fn rsync_new_file_path(&self) -> Option<std::path::PathBuf> {
+        self.current_file_path()
+    }
+
+    /// Enter `SendingDelta` after a successful diff. The caller has already
+    /// sent RsyncDeltaMeta with `info`.
+    pub fn begin_sending_delta(&mut self, spool: &Path, info: rsync::DeltaInfo) -> ResultType<()> {
+        if !matches!(self.rsync, RsyncState::Diffing) {
+            bail!("not diffing");
+        }
+        let reader = rsync::SpoolReader::new(spool)?;
+        self.rsync = RsyncState::SendingDelta {
+            reader,
+            next_chunk: 0,
+            num_chunks: info.num_chunks,
+            file_size: info.new_file_size,
+        };
+        Ok(())
+    }
+
+    /// Reader received the writer's per-file ack: finalize this file and
+    /// advance, mirroring the end-of-file logic of `read()`.
+    pub fn on_rsync_ack(&mut self) {
+        if !matches!(self.rsync, RsyncState::AwaitApply { .. }) {
+            return;
+        }
+        self.file_num += 1;
+        self.data_stream = None;
+        self.file_confirmed = false;
+        self.file_is_waiting = false;
+        self.rsync = RsyncState::Off;
+        self.rsync_counted = 0;
+        self.rsync_finalized = false;
+    }
+
+    // ---- writer (old-file side) message intake ----
+
+    pub fn on_rsync_delta_meta(&mut self, meta: &FileTransferRsyncDeltaMeta) -> ResultType<()> {
+        if !matches!(self.rsync, RsyncState::AwaitDelta) {
+            log::warn!(
+                "job {}: unexpected rsync delta meta in {:?}",
+                self.id,
+                self.rsync
+            );
+            return Ok(());
+        }
+        if meta.sha256.len() != 32 {
+            bail!("rsync delta meta: bad sha256 length {}", meta.sha256.len());
+        }
+        if meta.delta_len > rsync::MAX_DELTA_BYTES {
+            bail!(
+                "rsync delta meta: delta too large ({} bytes)",
+                meta.delta_len
+            );
+        }
+        let mut sha256 = [0u8; 32];
+        sha256.copy_from_slice(&meta.sha256);
+        let mut assembler = rsync::ChunkAssembler::new();
+        assembler.set_expected(meta.delta_len, meta.num_chunks);
+        self.rsync = RsyncState::ReceivingDelta {
+            assembler,
+            next_index: 0,
+        };
+        self.rsync_delta_meta = Some((meta.new_file_size, sha256, meta.last_modified));
+        Ok(())
+    }
+
+    /// Feed one delta chunk. Returns `RsyncApplyParams` when the delta is
+    /// complete (job enters `DeltaReady`); the caller runs apply + verify.
+    pub fn on_rsync_delta_chunk(
+        &mut self,
+        chunk: &FileTransferRsyncChunk,
+    ) -> ResultType<Option<RsyncApplyParams>> {
+        let complete = match &mut self.rsync {
+            RsyncState::ReceivingDelta { assembler, .. } => {
+                assembler.feed(chunk.chunk_index, chunk.compressed, &chunk.data)?
+            }
+            _ => {
+                // Stale chunk; ignore.
+                return Ok(None);
+            }
+        };
+        if !complete {
+            return Ok(None);
+        }
+        let (delta, meta) = match (std::mem::take(&mut self.rsync), self.rsync_delta_meta.take()) {
+            (
+                RsyncState::ReceivingDelta { assembler, .. },
+                Some((new_file_size, sha256, last_modified)),
+            ) => (assembler.finish(), (new_file_size, sha256, last_modified)),
+            _ => {
+                bail!("rsync delta complete but meta missing");
+            }
+        };
+        let old_file = self
+            .current_file_path()
+            .ok_or(anyhow!("rsync apply: no current file path"))?;
+        let out_file = rsync::rsync_out_path(&old_file);
+        self.rsync = RsyncState::DeltaReady {
+            delta: delta.clone(),
+            new_file_size: meta.0,
+            sha256: meta.1,
+            last_modified: meta.2,
+        };
+        Ok(Some(RsyncApplyParams {
+            old_file,
+            delta,
+            out_file,
+            new_file_size: meta.0,
+            sha256: meta.1,
+        }))
+    }
+
+    /// Writer-side finalize after `apply_and_verify` succeeded: replace the
+    /// target with the verified output, restore mtime, clean up temps.
+    pub fn rsync_finish(&mut self) {
+        if let Some(target) = self.current_file_path() {
+            let target_str = get_string(&target);
+            let out = rsync::rsync_out_path(&target);
+            if let Err(e) = std::fs::rename(&out, &target) {
+                log::error!("job {}: rsync finalize rename failed: {}", self.id, e);
+            }
+            let _ = std::fs::remove_file(format!("{}.download", target_str));
+            let _ = std::fs::remove_file(format!("{}.digest", target_str));
+            if let RsyncState::DeltaReady { last_modified, .. } = &self.rsync {
+                let _ = filetime::set_file_mtime(
+                    &target,
+                    filetime::FileTime::from_unix_time(*last_modified as _, 0),
+                );
+            }
+            rsync::cleanup_rsync_temps(&target);
+        }
+        self.rsync_finalized = true;
+        self.rsync = RsyncState::Off;
+    }
+
+    /// Revert the current file to legacy whole-file transfer. Local state is
+    /// reset unconditionally; `reason` is only for logging. The caller is
+    /// responsible for sending the FileTransferRsyncFallback message when
+    /// the peer needs to be told (use `rsync_fallback` semantics at the
+    /// call sites).
+    pub async fn rsync_fallback_local(&mut self) {
+        log::info!(
+            "job {}: rsync fallback for file {} (state was {:?})",
+            self.id,
+            self.file_num,
+            self.rsync
+        );
+        if let Some(p) = self.current_file_path() {
+            rsync::cleanup_rsync_temps(&p);
+        }
+        self.finished_size = self.finished_size.saturating_sub(self.rsync_counted);
+        self.rsync_counted = 0;
+        self.rsync_delta_meta = None;
+        self.rsync_old_file_missing = false;
+        self.rsync = RsyncState::Off;
+        if self.is_reader {
+            self.reset_stream_to_start().await;
+        } else {
+            // The next legacy block recreates `<file>.download` from scratch.
+            self.data_stream = None;
+        }
+    }
+
+    /// Reopen the current file at offset 0 WITHOUT touching
+    /// `file_confirmed`/`file_is_waiting` (unlike `open_data_stream`, which
+    /// would clear the confirm state and re-trigger the digest round-trip).
+    async fn reset_stream_to_start(&mut self) {
+        if let DataSource::FilePath(p) = &self.data_source {
+            let file_num = self.file_num as usize;
+            if file_num < self.files.len() {
+                let entry = &self.files[file_num];
+                let Some(path) = self.resolve_entry_path(p, &entry.name) else {
+                    return;
+                };
+                match tokio::fs::File::open(&path).await {
+                    Ok(mut f) => {
+                        if f.seek(std::io::SeekFrom::Start(0)).await.is_ok() {
+                            self.data_stream = Some(DataStream::FileStream(f));
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("job {}: rsync reset open failed: {}", self.id, e);
+                    }
+                }
+            }
         }
     }
 }
@@ -1240,6 +1829,108 @@ pub fn new_block(block: FileTransferBlock) -> Message {
     msg_out
 }
 
+// ---- rsync message builders ----
+// The controlling side sends rsync messages as FileAction, the controlled
+// side as FileResponse; both variants are provided for each message.
+
+fn build_rsync_action<F>(f: F) -> Message
+where
+    F: FnOnce(&mut FileAction),
+{
+    let mut action = FileAction::new();
+    f(&mut action);
+    let mut msg_out = Message::new();
+    msg_out.set_file_action(action);
+    msg_out
+}
+
+fn build_rsync_response<F>(f: F) -> Message
+where
+    F: FnOnce(&mut FileResponse),
+{
+    let mut resp = FileResponse::new();
+    f(&mut resp);
+    let mut msg_out = Message::new();
+    msg_out.set_file_response(resp);
+    msg_out
+}
+
+#[inline]
+pub fn new_rsync_chunk_action(chunk: FileTransferRsyncChunk) -> Message {
+    build_rsync_action(|a| a.set_rsync_chunk(chunk))
+}
+
+#[inline]
+pub fn new_rsync_chunk_response(chunk: FileTransferRsyncChunk) -> Message {
+    build_rsync_response(|r| r.set_rsync_chunk(chunk))
+}
+
+#[inline]
+pub fn new_rsync_meta_action(meta: FileTransferRsyncMeta) -> Message {
+    build_rsync_action(|a| a.set_rsync_meta(meta))
+}
+
+#[inline]
+pub fn new_rsync_meta_response(meta: FileTransferRsyncMeta) -> Message {
+    build_rsync_response(|r| r.set_rsync_meta(meta))
+}
+
+#[inline]
+pub fn new_rsync_delta_meta_action(meta: FileTransferRsyncDeltaMeta) -> Message {
+    build_rsync_action(|a| a.set_rsync_delta_meta(meta))
+}
+
+#[inline]
+pub fn new_rsync_delta_meta_response(meta: FileTransferRsyncDeltaMeta) -> Message {
+    build_rsync_response(|r| r.set_rsync_delta_meta(meta))
+}
+
+#[inline]
+pub fn new_rsync_fallback_action(id: i32, file_num: i32, reason: &str) -> Message {
+    build_rsync_action(|a| {
+        a.set_rsync_fallback(FileTransferRsyncFallback {
+            id,
+            file_num,
+            reason: reason.to_string(),
+            ..Default::default()
+        })
+    })
+}
+
+#[inline]
+pub fn new_rsync_fallback_response(id: i32, file_num: i32, reason: &str) -> Message {
+    build_rsync_response(|r| {
+        r.set_rsync_fallback(FileTransferRsyncFallback {
+            id,
+            file_num,
+            reason: reason.to_string(),
+            ..Default::default()
+        })
+    })
+}
+
+#[inline]
+pub fn new_rsync_ack_action(id: i32, file_num: i32) -> Message {
+    build_rsync_action(|a| {
+        a.set_rsync_ack(FileTransferRsyncAck {
+            id,
+            file_num,
+            ..Default::default()
+        })
+    })
+}
+
+#[inline]
+pub fn new_rsync_ack_response(id: i32, file_num: i32) -> Message {
+    build_rsync_response(|r| {
+        r.set_rsync_ack(FileTransferRsyncAck {
+            id,
+            file_num,
+            ..Default::default()
+        })
+    })
+}
+
 #[inline]
 pub fn new_send_confirm(r: FileTransferSendConfirmRequest) -> Message {
     let mut msg_out = Message::new();
@@ -1256,6 +1947,7 @@ pub fn new_receive(
     file_num: i32,
     files: Vec<FileEntry>,
     total_size: u64,
+    enable_rsync: bool,
 ) -> Message {
     let mut action = FileAction::new();
     action.set_receive(FileTransferReceiveRequest {
@@ -1264,6 +1956,7 @@ pub fn new_receive(
         files,
         file_num,
         total_size,
+        enable_rsync,
         ..Default::default()
     });
     let mut msg_out = Message::new();
@@ -1278,8 +1971,9 @@ pub fn new_send(
     path: String,
     file_num: i32,
     include_hidden: bool,
+    enable_rsync: bool,
 ) -> Message {
-    log::info!("new send: {}, id: {}", path, id);
+    log::info!("new send: {}, id: {}, rsync: {}", path, id, enable_rsync);
     let mut action = FileAction::new();
     let t: file_transfer_send_request::FileType = r#type.into();
     action.set_send(FileTransferSendRequest {
@@ -1288,6 +1982,7 @@ pub fn new_send(
         include_hidden,
         file_num,
         file_type: t.into(),
+        enable_rsync,
         ..Default::default()
     });
     let mut msg_out = Message::new();
@@ -1351,14 +2046,17 @@ pub async fn handle_read_jobs(
         if job.is_last_job {
             continue;
         }
-        match job.read().await {
+        match job.read_chunk().await {
             Err(err) => {
                 stream
                     .send(&new_error(job.id(), err, job.file_num()))
                     .await?;
             }
-            Ok(Some(block)) => {
+            Ok(Some(JobChunk::Block(block))) => {
                 stream.send(&new_block(block)).await?;
+            }
+            Ok(Some(JobChunk::RsyncDelta(chunk))) => {
+                stream.send(&new_rsync_chunk_response(chunk)).await?;
             }
             Ok(None) => {
                 if job.job_completed() {
@@ -1809,5 +2507,505 @@ mod tests {
             .set_files(vec![new_file_entry(r"\\?\C:\Windows\Temp\x.txt")])
             .expect_err("verbatim drive absolute path must be rejected");
         assert_err_contains(err, "absolute path");
+    }
+
+    // ---- rsync state machine tests ----
+
+    const BIG_SIZE: u64 = 2 * 1024 * 1024;
+
+    fn new_big_entry(name: &str) -> FileEntry {
+        let mut entry = new_file_entry(name);
+        entry.size = BIG_SIZE;
+        entry
+    }
+
+    fn confirm_overwrite(job: &mut TransferJob, file_num: i32) {
+        let req = FileTransferSendConfirmRequest {
+            id: job.id(),
+            file_num,
+            union: Some(file_transfer_send_confirm_request::Union::OffsetBlk(0)),
+            ..Default::default()
+        };
+        let _ = futures::executor::block_on(job.confirm(&req));
+    }
+
+    #[test]
+    fn rsync_confirm_offset0_reader_enters_await_signature() {
+        let tmp = TestTempDir::new("rsync_reader");
+        std::fs::create_dir_all(&tmp.path).unwrap();
+        let src = tmp.join("big.bin");
+        std::fs::write(&src, vec![0u8; BIG_SIZE as usize]).unwrap();
+        let mut job = TransferJob::new_read(
+            1,
+            JobType::Generic,
+            "".to_string(),
+            DataSource::FilePath(src),
+            0,
+            false,
+            true,
+            true,
+        )
+        .unwrap();
+        job.set_rsync_enabled(true);
+        assert!(matches!(job.rsync_state(), RsyncState::Off));
+        confirm_overwrite(&mut job, 0);
+        assert!(matches!(
+            job.rsync_state(),
+            RsyncState::AwaitSignature { .. }
+        ));
+    }
+
+    #[test]
+    fn rsync_confirm_reader_small_file_stays_off() {
+        let tmp = TestTempDir::new("rsync_small");
+        std::fs::create_dir_all(&tmp.path).unwrap();
+        let src = tmp.join("small.bin");
+        std::fs::write(&src, vec![0u8; 1024]).unwrap();
+        let mut job = TransferJob::new_read(
+            2,
+            JobType::Generic,
+            "".to_string(),
+            DataSource::FilePath(src),
+            0,
+            false,
+            true,
+            true,
+        )
+        .unwrap();
+        job.set_rsync_enabled(true);
+        confirm_overwrite(&mut job, 0);
+        assert!(job.rsync_state().is_off());
+    }
+
+    #[test]
+    fn rsync_confirm_writer_with_old_file_prepares_signature() {
+        let tmp = TestTempDir::new("rsync_writer");
+        let dir = tmp.join("dest");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("old.db"), vec![1u8; BIG_SIZE as usize]).unwrap();
+        let mut job = TransferJob::new_write(
+            3,
+            JobType::Generic,
+            "".to_string(),
+            DataSource::FilePath(dir.clone()),
+            0,
+            false,
+            false,
+            true,
+        )
+        .with_files(vec![new_big_entry("old.db")])
+        .unwrap();
+        job.set_rsync_enabled(true);
+        job.set_digest(BIG_SIZE, 0);
+        confirm_overwrite(&mut job, 0);
+        assert!(matches!(job.rsync_state(), RsyncState::PrepareSignature));
+        assert_eq!(
+            job.take_rsync_confirm_action(),
+            RsyncConfirmAction::ComputeSignature
+        );
+        assert_eq!(
+            job.rsync_signature_path(),
+            Some(dir.clone().join("old.db")),
+            "signature path must point at the old file"
+        );
+        job.rsync_signature_sent();
+        assert!(matches!(job.rsync_state(), RsyncState::AwaitDelta));
+    }
+
+    #[test]
+    fn rsync_confirm_writer_missing_old_file_sends_fallback() {
+        let tmp = TestTempDir::new("rsync_no_old");
+        let dir = tmp.join("dest");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut job = TransferJob::new_write(
+            4,
+            JobType::Generic,
+            "".to_string(),
+            DataSource::FilePath(dir),
+            0,
+            false,
+            false,
+            true,
+        )
+        .with_files(vec![new_big_entry("absent.db")])
+        .unwrap();
+        job.set_rsync_enabled(true);
+        job.set_digest(BIG_SIZE, 0);
+        confirm_overwrite(&mut job, 0);
+        assert_eq!(
+            job.take_rsync_confirm_action(),
+            RsyncConfirmAction::SendFallback
+        );
+        assert!(job.rsync_state().is_off());
+    }
+
+    #[test]
+    fn rsync_confirm_skip_and_resume_stay_off() {
+        let mut job = new_validation_job(5);
+        job.set_rsync_enabled(true);
+        job.set_digest(BIG_SIZE, 0);
+        let skip = FileTransferSendConfirmRequest {
+            id: job.id(),
+            file_num: 0,
+            union: Some(file_transfer_send_confirm_request::Union::Skip(true)),
+            ..Default::default()
+        };
+        let _ = futures::executor::block_on(job.confirm(&skip));
+        assert!(job.rsync_state().is_off());
+        let resume = FileTransferSendConfirmRequest {
+            id: job.id(),
+            file_num: 0,
+            union: Some(file_transfer_send_confirm_request::Union::OffsetBlk(4096)),
+            ..Default::default()
+        };
+        let _ = futures::executor::block_on(job.confirm(&resume));
+        assert!(job.rsync_state().is_off());
+    }
+
+    #[test]
+    fn rsync_meta_and_chunk_intake_reader() {
+        let tmp = TestTempDir::new("rsync_intake");
+        std::fs::create_dir_all(&tmp.path).unwrap();
+        let src = tmp.join("big.bin");
+        std::fs::write(&src, vec![0u8; BIG_SIZE as usize]).unwrap();
+        let mut job = TransferJob::new_read(
+            6,
+            JobType::Generic,
+            "".to_string(),
+            DataSource::FilePath(src),
+            0,
+            false,
+            true,
+            true,
+        )
+        .unwrap();
+        job.set_rsync_enabled(true);
+        confirm_overwrite(&mut job, 0);
+
+        let payload: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
+        let (c0, comp0) = crate::rsync::tests_encode_chunk_for_test(&payload[..600]);
+        let (c1, comp1) = crate::rsync::tests_encode_chunk_for_test(&payload[600..]);
+
+        job.on_rsync_meta(&FileTransferRsyncMeta {
+            id: 6,
+            file_num: 0,
+            old_file_size: 1,
+            block_size: 8192,
+            sig_len: payload.len() as u64,
+            num_chunks: 2,
+            ..Default::default()
+        });
+        assert!(matches!(
+            job.rsync_state(),
+            RsyncState::WaitingSigChunks { .. }
+        ));
+        let chunk0 = FileTransferRsyncChunk {
+            id: 6,
+            file_num: 0,
+            chunk_index: 0,
+            is_delta: false,
+            compressed: comp0,
+            data: c0.into(),
+            ..Default::default()
+        };
+        assert!(job.on_rsync_sig_chunk(&chunk0).unwrap().is_none());
+        let chunk1 = FileTransferRsyncChunk {
+            id: 6,
+            file_num: 0,
+            chunk_index: 1,
+            is_delta: false,
+            compressed: comp1,
+            data: c1.into(),
+            ..Default::default()
+        };
+        let done = job.on_rsync_sig_chunk(&chunk1).unwrap();
+        assert_eq!(done.as_deref(), Some(payload.as_slice()));
+        assert!(matches!(job.rsync_state(), RsyncState::Diffing));
+    }
+
+    #[tokio::test]
+    async fn rsync_delta_pump_and_ack_advance() {
+        let tmp = TestTempDir::new("rsync_pump");
+        std::fs::create_dir_all(&tmp.path).unwrap();
+        let src = tmp.join("big.bin");
+        std::fs::write(&src, vec![0u8; BIG_SIZE as usize]).unwrap();
+        let mut job = TransferJob::new_read(
+            7,
+            JobType::Generic,
+            "".to_string(),
+            DataSource::FilePath(src.clone()),
+            0,
+            false,
+            true,
+            true,
+        )
+        .unwrap();
+        job.set_rsync_enabled(true);
+        confirm_overwrite(&mut job, 0);
+
+        // fabricate a diff result: spool some bytes as the "delta"
+        let spool = tmp.join("spool.delta");
+        std::fs::write(&spool, vec![5u8; 100]).unwrap();
+        job.on_rsync_meta(&FileTransferRsyncMeta {
+            id: 7,
+            file_num: 0,
+            old_file_size: 1,
+            block_size: 8192,
+            sig_len: 8,
+            num_chunks: 1,
+            ..Default::default()
+        });
+        // push the state machine forward to Diffing via the public intake
+        let chunk = FileTransferRsyncChunk {
+            id: 7,
+            file_num: 0,
+            chunk_index: 0,
+            is_delta: false,
+            compressed: false,
+            data: vec![0u8; 8].into(),
+            ..Default::default()
+        };
+        job.on_rsync_sig_chunk(&chunk).unwrap();
+        assert!(matches!(job.rsync_state(), RsyncState::Diffing));
+
+        job.begin_sending_delta(
+            &spool,
+            rsync::DeltaInfo {
+                new_file_size: BIG_SIZE,
+                delta_len: 100,
+                num_chunks: 1,
+                sha256_new: [0u8; 32],
+                last_modified: 0,
+            },
+        )
+        .unwrap();
+
+        // one chunk per tick
+        let c = job.read_chunk().await.unwrap().unwrap();
+        match c {
+            JobChunk::RsyncDelta(rc) => {
+                assert_eq!(rc.chunk_index, 0);
+                assert!(rc.is_delta);
+            }
+            _ => panic!("expected rsync delta chunk"),
+        }
+        // spool exhausted -> AwaitApply, read_chunk yields None
+        assert!(job.read_chunk().await.unwrap().is_none());
+        assert!(matches!(job.rsync_state(), RsyncState::AwaitApply { .. }));
+
+        // progress snapped to full file size
+        assert_eq!(job.finished_size(), BIG_SIZE);
+
+        // ack advances the file (job has 1 file -> file_num becomes 1)
+        job.on_rsync_ack();
+        assert_eq!(job.file_num(), 1);
+        assert!(job.rsync_state().is_off());
+    }
+
+    #[tokio::test]
+    async fn rsync_fallback_resets_reader_stream_and_progress() {
+        let tmp = TestTempDir::new("rsync_fb");
+        std::fs::create_dir_all(&tmp.path).unwrap();
+        let src = tmp.join("big.bin");
+        std::fs::write(&src, vec![7u8; BIG_SIZE as usize]).unwrap();
+        let mut job = TransferJob::new_read(
+            8,
+            JobType::Generic,
+            "".to_string(),
+            DataSource::FilePath(src.clone()),
+            0,
+            false,
+            true,
+            true,
+        )
+        .unwrap();
+        job.set_rsync_enabled(true);
+        confirm_overwrite(&mut job, 0);
+        assert!(job.file_confirmed());
+        // book some fake rsync progress
+        job.on_rsync_meta(&FileTransferRsyncMeta {
+            id: 8,
+            file_num: 0,
+            old_file_size: 1,
+            block_size: 8192,
+            sig_len: 8,
+            num_chunks: 1,
+            ..Default::default()
+        });
+        // simulate counted progress via delta pump path
+        let spool = tmp.join("spool2.delta");
+        std::fs::write(&spool, vec![9u8; 10]).unwrap();
+        let chunk = FileTransferRsyncChunk {
+            id: 8,
+            file_num: 0,
+            chunk_index: 0,
+            is_delta: false,
+            compressed: false,
+            data: vec![0u8; 8].into(),
+            ..Default::default()
+        };
+        job.on_rsync_sig_chunk(&chunk).unwrap();
+        job.begin_sending_delta(
+            &spool,
+            rsync::DeltaInfo {
+                new_file_size: BIG_SIZE,
+                delta_len: 10,
+                num_chunks: 1,
+                sha256_new: [0u8; 32],
+                last_modified: 0,
+            },
+        )
+        .unwrap();
+        job.read_chunk().await.unwrap().unwrap();
+        job.read_chunk().await.unwrap(); // -> AwaitApply, progress snapped
+        assert_eq!(job.finished_size(), BIG_SIZE);
+
+        job.rsync_fallback_local().await;
+        assert!(job.rsync_state().is_off());
+        assert_eq!(
+            job.finished_size(),
+            0,
+            "rsync progress must be subtracted on fallback"
+        );
+        // confirm flags preserved: the reader must NOT re-trigger a digest
+        assert!(job.file_confirmed());
+        assert!(!job.file_is_waiting());
+        // legacy read works again from offset 0
+        let out = job.read_chunk().await.unwrap().unwrap();
+        assert!(matches!(out, JobChunk::Block(_)));
+    }
+
+    #[tokio::test]
+    async fn rsync_writer_delta_intake_to_apply_params() {
+        let tmp = TestTempDir::new("rsync_apply");
+        let dir = tmp.join("dest");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("old.db"), vec![1u8; BIG_SIZE as usize]).unwrap();
+        let mut job = TransferJob::new_write(
+            9,
+            JobType::Generic,
+            "".to_string(),
+            DataSource::FilePath(dir.clone()),
+            0,
+            false,
+            false,
+            true,
+        )
+        .with_files(vec![new_big_entry("old.db")])
+        .unwrap();
+        job.set_rsync_enabled(true);
+        job.set_digest(BIG_SIZE, 0);
+        confirm_overwrite(&mut job, 0);
+        assert_eq!(
+            job.take_rsync_confirm_action(),
+            RsyncConfirmAction::ComputeSignature
+        );
+        job.rsync_signature_sent();
+
+        let delta: Vec<u8> = (0..500u32).map(|i| i as u8).collect();
+        let (d0, comp0) = crate::rsync::tests_encode_chunk_for_test(&delta[..250]);
+        let (d1, comp1) = crate::rsync::tests_encode_chunk_for_test(&delta[250..]);
+        job.on_rsync_delta_meta(&FileTransferRsyncDeltaMeta {
+            id: 9,
+            file_num: 0,
+            new_file_size: BIG_SIZE,
+            delta_len: delta.len() as u64,
+            num_chunks: 2,
+            sha256: [2u8; 32].to_vec().into(),
+            last_modified: 12345,
+            ..Default::default()
+        })
+        .unwrap();
+        let c0 = FileTransferRsyncChunk {
+            id: 9,
+            file_num: 0,
+            chunk_index: 0,
+            is_delta: true,
+            compressed: comp0,
+            data: d0.into(),
+            ..Default::default()
+        };
+        assert!(job.on_rsync_delta_chunk(&c0).unwrap().is_none());
+        let c1 = FileTransferRsyncChunk {
+            id: 9,
+            file_num: 0,
+            chunk_index: 1,
+            is_delta: true,
+            compressed: comp1,
+            data: d1.into(),
+            ..Default::default()
+        };
+        let params = job.on_rsync_delta_chunk(&c1).unwrap().expect("complete");
+        assert_eq!(params.delta, delta);
+        assert_eq!(params.old_file, dir.join("old.db"));
+        assert_eq!(params.new_file_size, BIG_SIZE);
+        assert_eq!(params.sha256, [2u8; 32]);
+        assert!(matches!(job.rsync_state(), RsyncState::DeltaReady { .. }));
+    }
+
+    #[tokio::test]
+    async fn rsync_finish_replaces_target_and_modify_time_skips() {
+        let tmp = TestTempDir::new("rsync_finish");
+        let dir = tmp.join("dest");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("old.db");
+        std::fs::write(&target, vec![1u8; BIG_SIZE as usize]).unwrap();
+        // stale legacy temps that must be removed
+        std::fs::write(
+            format!("{}.download", get_string(&target)),
+            b"stale",
+        )
+        .unwrap();
+        let mut job = TransferJob::new_write(
+            10,
+            JobType::Generic,
+            "".to_string(),
+            DataSource::FilePath(dir.clone()),
+            0,
+            false,
+            false,
+            true,
+        )
+        .with_files(vec![new_big_entry("old.db")])
+        .unwrap();
+        job.set_rsync_enabled(true);
+        job.set_digest(BIG_SIZE, 0);
+        confirm_overwrite(&mut job, 0);
+        job.take_rsync_confirm_action();
+        job.rsync_signature_sent();
+
+        // deliver a (fake) delta; content correctness is covered by the
+        // rsync module tests — here we exercise finalize only.
+        let delta = vec![0u8; 16];
+        job.on_rsync_delta_meta(&FileTransferRsyncDeltaMeta {
+            id: 10,
+            file_num: 0,
+            new_file_size: BIG_SIZE,
+            delta_len: delta.len() as u64,
+            num_chunks: 1,
+            sha256: [0u8; 32].to_vec().into(),
+            last_modified: 42,
+            ..Default::default()
+        })
+        .unwrap();
+        let c = FileTransferRsyncChunk {
+            id: 10,
+            file_num: 0,
+            chunk_index: 0,
+            is_delta: true,
+            compressed: false,
+            data: delta.clone().into(),
+            ..Default::default()
+        };
+        let params = job.on_rsync_delta_chunk(&c).unwrap().unwrap();
+        // write the "verified" output where apply would have put it
+        std::fs::write(&params.out_file, b"newcontent").unwrap();
+        job.rsync_finish();
+        assert_eq!(std::fs::read(&target).unwrap(), b"newcontent");
+        assert!(!Path::new(&format!("{}.download", get_string(&target))).exists());
+        assert!(!params.out_file.exists());
+        // modify_time must skip the already-finalized file
+        job.modify_time();
+        assert_eq!(std::fs::read(&target).unwrap(), b"newcontent");
     }
 }

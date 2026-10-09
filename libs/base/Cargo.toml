@@ -29,6 +29,10 @@ backtrace = "0.3"
 log = "0.4"
 lazy_static = "1.5"
 anyhow = "1.0"
+sha2 = "0.10"
+fast_rsync = "0.2"
+memmap2 = "0.9"
+zstd = "0.13"
 
 [build-dependencies]
 protobuf-codegen = { version = "3.7" }
