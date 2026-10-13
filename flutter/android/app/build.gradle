@@ -98,7 +98,7 @@ android {
     }
 
     defaultConfig {
-        applicationId "rustdesk.foxhank.cn"
+        applicationId "cn.foxhank.foxdesk"
         minSdkVersion 22
         targetSdkVersion 36
         versionCode flutterVersionCode.toInteger()
