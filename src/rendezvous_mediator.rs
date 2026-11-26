@@ -668,7 +668,12 @@ impl RendezvousMediator {
         }
         let relay_server = self.get_relay_server(ph.relay_server);
         // for ensure, websocket go relay directly
-        if ph.nat_type.enum_value() == Ok(NatType::SYMMETRIC)
+        // The master may report SYMMETRIC from the TCP NAT test while its UDP mapping is
+        // endpoint-independent (common behind CGNAT), so still try UDP punch when its UDP
+        // test passed; on failure the master falls back to relay after a short timeout.
+        let master_symmetric_udp_ok =
+            ph.nat_type.enum_value() == Ok(NatType::SYMMETRIC) && ph.udp_port > 0;
+        if (ph.nat_type.enum_value() == Ok(NatType::SYMMETRIC) && !master_symmetric_udp_ok)
             || Config::get_nat_type() == NatType::SYMMETRIC as i32
             || relay
             || (config::is_disable_tcp_listen() && ph.udp_port <= 0)
