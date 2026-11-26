@@ -1113,13 +1113,9 @@ pub fn get_ipv6_punch_enabled() -> bool {
 
 pub fn get_local_option(key: &str) -> String {
     let v = LocalConfig::get_option(key);
-    if key == keys::OPTION_ENABLE_UDP_PUNCH || key == keys::OPTION_ENABLE_IPV6_PUNCH {
-        if v.is_empty() {
-            if !is_public(&Config::get_rendezvous_server()) {
-                return "N".to_owned();
-            }
-        }
-    }
+    // foxhank: enable-udp-punch / enable-ipv6-punch default ON even for custom servers.
+    // Upstream defaults them off for self-hosted because official OSS servers dropped UDP
+    // punch support; our hbbs restores it, so keep the feature on like public servers.
     v
 }
 
